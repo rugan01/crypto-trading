@@ -59,9 +59,8 @@ The Telegram values can be copied from the existing private trading-system envir
 
 ```bash
 cd /Users/rugan/Projects/Delta
-python3 -m venv .venv
+./scripts/bootstrap.sh
 source .venv/bin/activate
-pip install -r requirements.txt
 
 python3 -m unittest -v
 python3 -m delta_live.cli doctor
@@ -106,3 +105,10 @@ The code still refuses production orders. Before the first demo order session, s
 ## Session evidence
 
 - [11 July 2026 BTC 15-minute testnet session](SESSIONS/2026-07-11-testnet-15m.md)
+- [11 July 2026 BTC 100-contract, five-minute testnet session](SESSIONS/2026-07-11-testnet-100x5m.md)
+
+## macOS Python warning
+
+Apple's Command Line Tools Python 3.9 is linked to LibreSSL 2.8.3, which causes urllib3 v2 to emit `NotOpenSSLWarning`. The warning does not invalidate completed API calls, but the system interpreter is not the supported runtime for this project. `scripts/bootstrap.sh` prefers Homebrew Python, creates `.venv`, and installs dependencies. Run all commands after `source .venv/bin/activate`, or invoke `.venv/bin/python` explicitly.
+
+When splitting a shell command across lines, the backslash must be the final character. `\\ ` (backslash followed by a space) does not continue the command correctly.
