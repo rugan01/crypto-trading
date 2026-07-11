@@ -72,6 +72,17 @@ python3 -m delta_live.cli telegram-test
 
 `dry-run` discovers the expiry and ATM pair and applies the liquidity gate, but cannot place an order. A liquidity rejection is a successful safety outcome, not a software failure.
 
+### Time-bounded demo order session
+
+Use a shell-only override so the local file remains dry-run by default:
+
+```bash
+DELTA_DRY_RUN=false python3 -m delta_live.session \
+  --asset BTC --size 1 --minutes 15 --confirm-sandbox-orders
+```
+
+The session refuses to start if it finds an existing position or active order. It enters one matched ATM straddle, monitors the combined executable-price stop, exits both legs after the requested duration, and emits Telegram and JSONL events.
+
 ## Testnet activation boundary
 
 Only after authenticated reads, Telegram, reconciliation, and dry-run evidence pass:
@@ -91,3 +102,7 @@ The code still refuses production orders. Before the first demo order session, s
 - Implement partial-fill repair and emergency flatten integration tests.
 - Exercise several demo sessions and review their event logs.
 - Add heartbeat/dead-man protection if supported for the account.
+
+## Session evidence
+
+- [11 July 2026 BTC 15-minute testnet session](SESSIONS/2026-07-11-testnet-15m.md)

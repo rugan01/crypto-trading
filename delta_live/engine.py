@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -60,8 +61,11 @@ class ExecutionEngine:
         with self.log_path.open("a") as handle:
             handle.write(json.dumps(row, default=str, sort_keys=True) + "\n")
         if name in {"ready", "no_trade", "entry_filled", "stop_armed", "stop_triggered", "closed", "halted"}:
-            self.notifier.send(f"Delta {self.settings.environment.upper()} | {name}\n" +
-                               "\n".join(f"{k}: {v}" for k, v in fields.items()))
+            message = (f"Delta {self.settings.environment.upper()} | {name}\n" +
+                       "\n".join(f"{k}: {v}" for k, v in fields.items()))
+            # A slow Telegram API must never delay stop arming or risk ticks.
+            threading.Thread(target=self.notifier.send, args=(message,),
+                             name=f"telegram-{name}", daemon=False).start()
 
     def select_atm(self, chain: list[dict], spot: Decimal) -> tuple[dict, dict]:
         by_strike: dict[Decimal, dict[str, dict]] = {}

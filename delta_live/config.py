@@ -44,8 +44,8 @@ class Settings:
         if environment not in {"testnet", "production"}:
             raise ValueError("DELTA_ENV must be testnet or production")
         if environment == "testnet":
-            key = os.getenv("DELTA_TESTNET_API_KEY")
-            secret = os.getenv("DELTA_TESTNET_API_SECRET")
+            key = os.getenv("DELTA_TESTNET_API_KEY") or os.getenv("DEMO_API_KEY")
+            secret = os.getenv("DELTA_TESTNET_API_SECRET") or os.getenv("DEMO_API_SECRET")
             rest, ws = TESTNET_REST, TESTNET_PUBLIC_WS
         else:
             key = os.getenv("DELTA_API_KEY") or os.getenv("API_KEY")

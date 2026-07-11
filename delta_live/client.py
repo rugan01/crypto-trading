@@ -68,8 +68,18 @@ class DeltaRESTClient:
         return self.request("GET", "/v2/tickers", {"contract_types": "call_options,put_options",
                             "underlying_asset_symbols": asset, "expiry_date": expiry})
 
-    def positions(self) -> list[dict[str, Any]]:
-        return self.request("GET", "/v2/positions", auth=True)
+    def positions(self, asset: str) -> list[dict[str, Any]]:
+        return self.request("GET", "/v2/positions", {"underlying_asset_symbol": asset}, auth=True)
+
+    def balances(self) -> list[dict[str, Any]]:
+        return self.request("GET", "/v2/wallet/balances", auth=True)
+
+    def fills(self, product_id: int | None = None) -> list[dict[str, Any]]:
+        params = {"product_id": product_id} if product_id is not None else {}
+        return self.request("GET", "/v2/fills", params, auth=True)
+
+    def order(self, order_id: int) -> dict[str, Any]:
+        return self.request("GET", f"/v2/orders/{order_id}", auth=True)
 
     def active_orders(self) -> list[dict[str, Any]]:
         return self.request("GET", "/v2/orders", {"state": "open"}, auth=True)
