@@ -1,0 +1,3 @@
+asset,requested_start,requested_end,requested_expiry_days,completed_expiry_days,first_completed_expiry,last_completed_expiry,catalog_expiry_days,direct_symbol_resolution_used
+BTC,2026-01-01,2026-07-10,191,191,2026-01-01,2026-07-10,91,True
+ETH,2026-01-01,2026-07-10,191,191,2026-01-01,2026-07-10,90,True

@@ -1,0 +1,6 @@
+candidate_id,trades,gross_pnl,fees,net_pnl,avg_pnl,median_pnl,win_rate,avg_profitable_trade,avg_losing_trade,payoff_ratio,profit_factor,sharpe_daily_annualized,max_drawdown,max_drawdown_duration_days,max_drawdown_duration_trades,max_drawdown_date,recovery_date,recovered,max_consecutive_wins,max_consecutive_losses,best_trade,worst_trade,cvar_95
+btc_1700_combined_150,122,1318.63,317.85,1000.78,8.2031,5.7387,0.7213,15.6657,-11.1118,1.4098,3.6489,8.3979,121.38,19,18,2025-10-03,2025-10-14,True,12,5,62.4,-51.96,-34.45
+btc_1700_independent_100,122,1195.24,322.95,872.29,7.15,3.9995,0.6721,15.6495,-10.274,1.5232,3.1226,7.4164,122.8,22,21,2025-10-07,2025-10-17,True,12,5,62.4,-46.28,-32.18
+eth_1515_independent_150,122,1045.79,329.43,716.36,5.8718,11.8451,0.6475,23.5376,-26.5839,0.8854,1.6267,3.826,327.94,44,43,2025-10-22,2025-11-21,True,9,5,50.28,-128.09,-65.01
+eth_1645_combined_150,122,290.53,221.45,69.07,0.5662,3.0353,0.5738,10.9787,-13.4506,0.8162,1.0988,0.6973,124.03,97,97,2025-10-13,,False,5,8,27.72,-57.38,-37.45
+btc_1700_combined_50_challenger,122,1317.77,317.89,999.88,8.1957,5.7387,0.7131,15.8066,-10.7228,1.4741,3.6642,8.6609,95.75,16,15,2025-10-06,2025-10-11,True,12,5,62.4,-40.11,-28.05

@@ -1,0 +1,21 @@
+.env
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+data/raw/
+outputs/
+HANDOFF.md
+
+# Generated datasets are reproducible but too large/noisy for the public repo.
+results/**
+!results/**/
+!results/**/REPORT.md
+!results/btc_1700_premium_analysis/group_metrics.csv
+!results/btc_1700_premium_analysis/summary.json
+!results/final_holdout_2025_jan_aug/summary.csv
+!results/final_holdout_2025_jan_aug/manifest.json
+!results/validation_2025_sep_dec_frozen/summary.csv
+!results/validation_2025_sep_dec_frozen/manifest.json
+!results/research_2026_jan01_jul10_50bps/summary.csv
+!results/research_2026_jan01_jul10_50bps/data_audit.csv

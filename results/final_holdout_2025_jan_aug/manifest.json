@@ -1,0 +1,31 @@
+{
+  "phase": "final_holdout",
+  "start": "2025-01-01",
+  "end": "2025-08-31",
+  "reserved_unseen": "none; final historical holdout consumed",
+  "lots": 200,
+  "slippage_bps": 50.0,
+  "candidates": [
+    {
+      "asset": "BTC",
+      "entry_minute": 1020,
+      "method": "combined",
+      "stop_pct": 50,
+      "id": "btc_1700_combined_50"
+    },
+    {
+      "asset": "BTC",
+      "entry_minute": 1020,
+      "method": "leg_independent",
+      "stop_pct": 100,
+      "id": "btc_1700_independent_100"
+    },
+    {
+      "asset": "ETH",
+      "entry_minute": 915,
+      "method": "leg_independent",
+      "stop_pct": 150,
+      "id": "eth_1515_independent_150"
+    }
+  ]
+}

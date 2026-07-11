@@ -1,0 +1,29 @@
+{
+  "observations": 556,
+  "first_expiry": "2025-01-01",
+  "last_expiry": "2026-07-10",
+  "premium_min": 43.660845944100004,
+  "premium_q25": 117.23122141485,
+  "premium_median": 158.987394494375,
+  "premium_mean": 172.84399999627212,
+  "premium_q75": 210.9715301346125,
+  "premium_max": 712.9998773037,
+  "smaller_leg_share_mean": 0.2481502014741975,
+  "smaller_leg_share_median": 0.24145227255973328,
+  "balanced_35pct_frequency": 0.30935251798561153,
+  "premium_pnl_correlation": 0.408616229411208,
+  "premium_pct_spot_pnl_correlation": 0.3332403656762381,
+  "balance_pnl_correlation": 0.2860477536259042,
+  "quintile_cut_points": [
+    109.80616361310001,
+    140.37062689535,
+    180.38900454025003,
+    223.32537743245
+  ],
+  "premium_pct_spot_quintile_cut_points": [
+    0.00122826450989513,
+    0.001556790601804304,
+    0.0019002113676431169,
+    0.0024420779536683014
+  ]
+}
