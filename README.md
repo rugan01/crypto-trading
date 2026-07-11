@@ -80,6 +80,8 @@ The repository now contains a testnet-locked execution foundation in `delta_live
 
 See [the sandbox execution runbook](docs/SANDBOX_EXECUTION_RUNBOOK.md) for the strategy, controls, configuration, commands, and remaining validation stages.
 
+The private execution evidence and post-trade learning loop follow the [Delta trade journal schema](docs/JOURNAL_SCHEMA.md).
+
 ## Important interpretation boundary
 
 Historical option marks are fair-value/risk marks, not guaranteed executable

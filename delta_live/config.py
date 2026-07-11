@@ -55,10 +55,12 @@ class Settings:
                    os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"),
                    rest, ws, Path(os.getenv("DELTA_LOG_DIR", "outputs/live")))
 
-    def assert_order_mode(self) -> None:
-        if self.environment != "testnet":
-            raise RuntimeError("This release is testnet-locked; production orders are disabled")
+    def assert_order_mode(self, allow_production: bool = False) -> None:
+        if self.environment == "production" and not allow_production:
+            raise RuntimeError("Production orders require an explicit production confirmation")
+        if self.environment == "production" and os.getenv("DELTA_PRODUCTION_ACK") != "LIVE_ORDERS_AUTHORIZED":
+            raise RuntimeError("Set the one-session DELTA_PRODUCTION_ACK to authorize production")
         if self.dry_run:
             raise RuntimeError("Order submission is disabled while DELTA_DRY_RUN=true")
         if not self.api_key or not self.api_secret:
-            raise RuntimeError("Dedicated DELTA_TESTNET_API_KEY/SECRET are required")
+            raise RuntimeError("API credentials are required for the selected environment")

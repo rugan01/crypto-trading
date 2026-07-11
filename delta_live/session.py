@@ -64,9 +64,10 @@ def nearest_chain(client: DeltaRESTClient, asset: str) -> tuple[str, list[dict]]
     raise RuntimeError("No testnet option expiry found in the next seven days")
 
 
-def run_session(asset: str, size: int, minutes: int, env_file: Path) -> int:
+def run_session(asset: str, size: int, minutes: int, env_file: Path,
+                allow_production: bool = False, min_free_margin: Decimal = Decimal("30")) -> int:
     settings = Settings.load(env_file)
-    settings.assert_order_mode()
+    settings.assert_order_mode(allow_production=allow_production)
     strategy = StrategyConfig(asset=asset, size=size, persistence_ticks=2)
     engine = ExecutionEngine(settings, strategy)
     client = engine.client
@@ -78,15 +79,36 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path) -> int:
     call_row, put_row = engine.select_atm(chain, spot)
     call_symbol, put_symbol = call_row["symbol"], put_row["symbol"]
     call_product, put_product = client.product(call_symbol), client.product(put_symbol)
+    for product in (call_product, put_product):
+        leverage = Decimal(str(client.order_leverage(int(product["id"]))["leverage"]))
+        if leverage != Decimal("200"):
+            raise RuntimeError(f"NO TRADE: {product['symbol']} leverage is {leverage}, not 200")
     call_quote, put_quote = engine.preflight(call_row, put_row)
+    if settings.environment == "production":
+        usd = next(b for b in client.balances() if b.get("asset_symbol") == "USD")
+        available = Decimal(str(usd["available_balance"]))
+        contract_value = Decimal(str(call_product["contract_value"]))
+        base_margin = spot * contract_value * size / Decimal("200") * 2
+        premium_margin = (call_quote.bid + put_quote.bid) * contract_value * size
+        projected_free = available - base_margin - premium_margin - Decimal("5")
+        planned_max_loss = (call_quote.bid + put_quote.bid) * Decimal("0.50") * contract_value * size + Decimal("5")
+        engine.event("margin_preflight", available=available, base_margin=base_margin,
+                     premium_margin=premium_margin, fee_buffer=5, projected_free=projected_free,
+                     required_free=min_free_margin, planned_max_loss=planned_max_loss,
+                     daily_loss_cap=25)
+        if projected_free < min_free_margin:
+            raise RuntimeError(f"NO TRADE: projected free margin {projected_free} below {min_free_margin}")
+        if planned_max_loss > Decimal("25"):
+            raise RuntimeError(f"NO TRADE: planned max loss {planned_max_loss} exceeds 25")
     engine.event("session_start", asset=asset, expiry=expiry, minutes=minutes, size=size,
                  call=call_symbol, put=put_symbol)
 
     engine.state = State.ENTERING
     # Testnet quotes can move between discovery and signed submission. A bounded
     # 5%-through-bid IOC remains a limit order while tolerating that latency.
-    call_limit = call_quote.bid * Decimal("0.95")
-    put_limit = put_quote.bid * Decimal("0.95")
+    tolerance = Decimal("0.98") if settings.environment == "production" else Decimal("0.95")
+    call_limit = call_quote.bid * tolerance
+    put_limit = put_quote.bid * tolerance
     engine.event("entry_intent", call_bid=call_quote.bid, put_bid=put_quote.bid,
                  call_limit=call_limit, put_limit=put_limit)
     call_order = client.place_order(engine.order_payload(call_product, "sell", size, call_limit, "ce", False))
@@ -160,18 +182,32 @@ def close_positions(engine: ExecutionEngine, legs: list[tuple[dict, str, int]]) 
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Run a time-bounded Delta testnet straddle session")
+    p = argparse.ArgumentParser(description="Run a time-bounded Delta straddle session")
     p.add_argument("--asset", choices=["BTC", "ETH"], default="BTC")
     p.add_argument("--size", type=int, default=1)
     p.add_argument("--minutes", type=int, default=15)
+    p.add_argument("--start-at", help="Optional IST start time, HH:MM:SS")
     p.add_argument("--env-file", type=Path, default=Path(".env"))
     p.add_argument("--confirm-sandbox-orders", action="store_true")
+    p.add_argument("--confirm-production-orders", action="store_true")
     args = p.parse_args()
-    if not args.confirm_sandbox_orders:
+    settings = Settings.load(args.env_file)
+    if settings.environment == "production" and not args.confirm_production_orders:
+        raise SystemExit("Add --confirm-production-orders to authorize live orders")
+    if settings.environment == "testnet" and not args.confirm_sandbox_orders:
         raise SystemExit("Add --confirm-sandbox-orders to authorize demo orders")
     if args.size < 1 or args.minutes < 1 or args.minutes > 30:
         raise SystemExit("size must be positive; minutes must be 1..30")
-    return run_session(args.asset, args.size, args.minutes, args.env_file)
+    if args.start_at:
+        target_time = datetime.strptime(args.start_at, "%H:%M:%S").time()
+        target = datetime.combine(datetime.now(IST).date(), target_time, IST)
+        seconds = (target - datetime.now(IST)).total_seconds()
+        if seconds < -60 or seconds > 15 * 60:
+            raise SystemExit("Scheduled start must be from one minute late to 15 minutes ahead")
+        while (target - datetime.now(IST)).total_seconds() > 0:
+            time.sleep(min(5, (target - datetime.now(IST)).total_seconds()))
+    return run_session(args.asset, args.size, args.minutes, args.env_file,
+                       allow_production=args.confirm_production_orders)
 
 
 if __name__ == "__main__":

@@ -81,6 +81,9 @@ class DeltaRESTClient:
     def order(self, order_id: int) -> dict[str, Any]:
         return self.request("GET", f"/v2/orders/{order_id}", auth=True)
 
+    def order_leverage(self, product_id: int) -> dict[str, Any]:
+        return self.request("GET", f"/v2/products/{product_id}/orders/leverage", auth=True)
+
     def active_orders(self) -> list[dict[str, Any]]:
         return self.request("GET", "/v2/orders", {"state": "open"}, auth=True)
 
