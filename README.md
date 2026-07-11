@@ -74,6 +74,12 @@ python delta_0dte.py backtest \
 
 See [RUNBOOK.md](docs/RUNBOOK.md) for validation and diagnostics commands.
 
+## Sandbox execution engine
+
+The repository now contains a testnet-locked execution foundation in `delta_live/`. It includes signed REST access, WebSocket quote transport, liquidity gating, combined executable-premium stop logic, Telegram alerts, event logs, and safety tests. It does not yet run unattended or permit production orders.
+
+See [the sandbox execution runbook](docs/SANDBOX_EXECUTION_RUNBOOK.md) for the strategy, controls, configuration, commands, and remaining validation stages.
+
 ## Important interpretation boundary
 
 Historical option marks are fair-value/risk marks, not guaranteed executable
