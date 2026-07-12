@@ -84,6 +84,8 @@ The private execution evidence and post-trade learning loop follow the [Delta tr
 
 Additional option-only strategy hypotheses and the frozen walk-forward protocol are in [STRATEGY_CANDIDATES.md](docs/STRATEGY_CANDIDATES.md).
 
+The first non-straddle research results are summarized in [results/hypotheses/REPORT.md](results/hypotheses/REPORT.md).
+
 ## Important interpretation boundary
 
 Historical option marks are fair-value/risk marks, not guaranteed executable
