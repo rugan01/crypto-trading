@@ -88,6 +88,8 @@ The first non-straddle research results are summarized in [results/hypotheses/RE
 
 The higher-timeframe positional study is specified in [POSITIONAL_MTF_SPEC.md](docs/POSITIONAL_MTF_SPEC.md); [positional_mtf.py](positional_mtf.py) generates the daily/4h/30m pivot signals.
 
+Production execution, monitoring, scheduler failure analysis, and cloud-hosting constraints are documented in [AUTOMATION.md](docs/AUTOMATION.md).
+
 ## Important interpretation boundary
 
 Historical option marks are fair-value/risk marks, not guaranteed executable
