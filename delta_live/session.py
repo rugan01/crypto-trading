@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -68,6 +69,8 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
                 allow_production: bool = False, min_free_margin: Decimal = Decimal("30")) -> int:
     settings = Settings.load(env_file)
     settings.assert_order_mode(allow_production=allow_production)
+    if allow_production:
+        os.environ["DELTA_PRODUCTION_ORDER_MODE"] = "1"
     strategy = StrategyConfig(asset=asset, size=size, persistence_ticks=2)
     engine = ExecutionEngine(settings, strategy)
     client = engine.client

@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import random
+import os
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -88,9 +89,9 @@ class DeltaRESTClient:
         return self.request("GET", "/v2/orders", {"state": "open"}, auth=True)
 
     def place_order(self, order: dict[str, Any]) -> dict[str, Any]:
-        self.settings.assert_order_mode()
+        self.settings.assert_order_mode(allow_production=os.getenv("DELTA_PRODUCTION_ORDER_MODE") == "1")
         return self.request("POST", "/v2/orders", payload=order, auth=True)
 
     def cancel_order(self, order_id: int, product_id: int) -> dict[str, Any]:
-        self.settings.assert_order_mode()
+        self.settings.assert_order_mode(allow_production=os.getenv("DELTA_PRODUCTION_ORDER_MODE") == "1")
         return self.request("DELETE", "/v2/orders", payload={"id": order_id, "product_id": product_id}, auth=True)
