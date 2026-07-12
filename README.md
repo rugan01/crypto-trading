@@ -82,6 +82,8 @@ See [the sandbox execution runbook](docs/SANDBOX_EXECUTION_RUNBOOK.md) for the s
 
 The private execution evidence and post-trade learning loop follow the [Delta trade journal schema](docs/JOURNAL_SCHEMA.md).
 
+Additional option-only strategy hypotheses and the frozen walk-forward protocol are in [STRATEGY_CANDIDATES.md](docs/STRATEGY_CANDIDATES.md).
+
 ## Important interpretation boundary
 
 Historical option marks are fair-value/risk marks, not guaranteed executable
