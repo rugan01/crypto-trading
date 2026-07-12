@@ -37,6 +37,26 @@ DELTA_ENV=production .venv/bin/python -m delta_live.monitor \
 
 This process is read-only. It is not a replacement for an attached broker stop order. If a leg is manually closed, it records `structure_changed` and does not invent a new combined stop from the remaining leg.
 
+## macOS production schedule
+
+The active local schedule is a single `launchd` job:
+
+- Plist: `~/Library/LaunchAgents/com.rugan.delta-btc-0dte.plist`
+- Wrapper: `scripts/run_production_btc_0dte.sh`
+- Schedule: 13 July 2026 at 16:55 IST
+- Working directory: `/Users/rugan/Projects/Delta`
+- Logs: `outputs/live/production-scheduler-YYYYMMDD.log`, plus launchd stdout/stderr files
+- Command: production overrides, 100 BTC contracts per leg, wait until 17:00, 25-minute session
+
+Verification:
+
+```bash
+launchctl print gui/$(id -u)/com.rugan.delta-btc-0dte
+launchctl list | rg 'com.rugan.delta-btc-0dte'
+```
+
+The job is currently loaded and `not running`, which is expected before 16:55. It is not duplicated with a Codex automation.
+
 ## What failed today
 
 The Codex automation was configured against `/Users/rugan/Documents/New project`, not the Delta project. It did not start. A manual production session then reached the entry point but failed closed because the CLI confirmation was not propagated into the client order method. That propagation is now fixed. The account remained flat until the user manually executed and closed the trade.
