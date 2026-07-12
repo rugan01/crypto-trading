@@ -86,6 +86,8 @@ Additional option-only strategy hypotheses and the frozen walk-forward protocol 
 
 The first non-straddle research results are summarized in [results/hypotheses/REPORT.md](results/hypotheses/REPORT.md).
 
+The higher-timeframe positional study is specified in [POSITIONAL_MTF_SPEC.md](docs/POSITIONAL_MTF_SPEC.md); [positional_mtf.py](positional_mtf.py) generates the daily/4h/30m pivot signals.
+
 ## Important interpretation boundary
 
 Historical option marks are fair-value/risk marks, not guaranteed executable
