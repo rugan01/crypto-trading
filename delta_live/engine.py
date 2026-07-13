@@ -60,7 +60,8 @@ class ExecutionEngine:
         row = {"time": self.clock().isoformat(), "state": self.state.value, "event": name, **fields}
         with self.log_path.open("a") as handle:
             handle.write(json.dumps(row, default=str, sort_keys=True) + "\n")
-        if name in {"ready", "no_trade", "entry_filled", "stop_armed", "stop_triggered", "closed", "halted"}:
+        if name in {"ready", "no_trade", "adopted_position", "entry_filled", "stop_armed",
+                    "stop_triggered", "closed", "halted"}:
             message = (f"Delta {self.settings.environment.upper()} | {name}\n" +
                        "\n".join(f"{k}: {v}" for k, v in fields.items()))
             # A slow Telegram API must never delay stop arming or risk ticks.

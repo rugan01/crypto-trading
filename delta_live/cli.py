@@ -17,11 +17,13 @@ IST = ZoneInfo("Asia/Kolkata")
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Delta 0DTE sandbox execution engine")
-    p.add_argument("command", choices=["doctor", "discover", "dry-run", "telegram-test"])
+    p.add_argument("command", choices=["doctor", "discover", "dry-run", "telegram-test",
+                                       "telegram-notify"])
     p.add_argument("--asset", choices=["BTC", "ETH"], default="BTC")
     p.add_argument("--size", type=int, default=200)
     p.add_argument("--expiry", help="DD-MM-YYYY; default is today or next day")
     p.add_argument("--env-file", type=Path, default=Path(".env"))
+    p.add_argument("--message", help="Message for telegram-notify")
     return p
 
 
@@ -29,11 +31,15 @@ def main() -> int:
     args = parser().parse_args()
     settings = Settings.load(args.env_file)
     client = DeltaRESTClient(settings)
-    if args.command == "telegram-test":
+    if args.command in {"telegram-test", "telegram-notify"}:
         from .telegram import TelegramNotifier
+        message = (args.message if args.command == "telegram-notify" else
+                   "Delta 0DTE engine test: Telegram notifications are working (no order placed).")
+        if not message:
+            raise SystemExit("--message is required for telegram-notify")
         sent = TelegramNotifier(settings.telegram_token, settings.telegram_chat_id).send(
-            "Delta 0DTE engine test: Telegram notifications are working (no order placed).")
-        print("Telegram test sent" if sent else "Telegram is not configured")
+            message)
+        print("Telegram message sent" if sent else "Telegram is not configured")
         return 0 if sent else 2
     if args.command == "doctor":
         print(json.dumps({"environment": settings.environment, "dry_run": settings.dry_run,
