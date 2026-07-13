@@ -5,7 +5,12 @@ cd /Users/rugan/Projects/Delta
 mkdir -p outputs/live
 exec >> outputs/live/production-scheduler-$(date +%Y%m%d).log 2>&1
 
-echo "scheduler_started $(date -Is)"
+echo "scheduler_started $(date '+%Y-%m-%dT%H:%M:%S%z')"
+if ! DELTA_ENV=production /Users/rugan/Projects/Delta/.venv/bin/python \
+  -m delta_live.cli telegram-notify \
+  --message "Delta BTC 0DTE production scheduler started at 16:55 IST; preflight and paired entry are scheduled for 17:00 IST."; then
+  echo "telegram_startup_notification_failed"
+fi
 exec env \
   DELTA_ENV=production \
   DELTA_DRY_RUN=false \
