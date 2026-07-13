@@ -174,7 +174,7 @@ def nearest_chain(client: DeltaRESTClient, asset: str) -> tuple[str, list[dict]]
 def run_session(asset: str, size: int, minutes: int, env_file: Path,
                 allow_production: bool = False, min_free_margin: Decimal = Decimal("30"),
                 slice_size: int = 25, entry_window: float = 20,
-                unmatched_grace: float = 10) -> int:
+                unmatched_grace: float = 10, exit_at: str | None = None) -> int:
     settings = Settings.load(env_file)
     settings.assert_order_mode(allow_production=allow_production)
     if allow_production:
@@ -235,10 +235,17 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
     book = QuoteBook()
     stream = PublicQuoteStream(settings.public_ws_url, [call_symbol, put_symbol], book.update)
     stream.start()
-    deadline = time.monotonic() + minutes * 60
+    monotonic_deadline = time.monotonic() + minutes * 60
+    wall_deadline = None
+    if exit_at:
+        exit_time = datetime.strptime(exit_at, "%H:%M:%S").time()
+        wall_deadline = datetime.combine(datetime.now(IST).date(), exit_time, IST)
+        if wall_deadline <= datetime.now(IST):
+            raise RuntimeError(f"Forced-exit time {exit_at} IST has already passed")
     reason = "time_exit"
     try:
-        while time.monotonic() < deadline:
+        while ((datetime.now(IST) < wall_deadline) if wall_deadline
+               else (time.monotonic() < monotonic_deadline)):
             pair = book.pair(call_symbol, put_symbol)
             if pair and stream.last_message_age <= 3:
                 if engine.observe_stop(*pair):
@@ -294,6 +301,7 @@ def main() -> int:
     p.add_argument("--size", type=int, default=1)
     p.add_argument("--minutes", type=int, default=15)
     p.add_argument("--start-at", help="Optional IST start time, HH:MM:SS")
+    p.add_argument("--exit-at", help="Absolute forced-exit time in IST, HH:MM:SS")
     p.add_argument("--slice-size", type=int, default=25)
     p.add_argument("--entry-window", type=float, default=20)
     p.add_argument("--unmatched-grace", type=float, default=10)
@@ -320,7 +328,7 @@ def main() -> int:
     return run_session(args.asset, args.size, args.minutes, args.env_file,
                        allow_production=args.confirm_production_orders,
                        slice_size=args.slice_size, entry_window=args.entry_window,
-                       unmatched_grace=args.unmatched_grace)
+                       unmatched_grace=args.unmatched_grace, exit_at=args.exit_at)
 
 
 if __name__ == "__main__":

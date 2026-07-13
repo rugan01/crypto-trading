@@ -25,7 +25,7 @@ python -m delta_live.session \
   --confirm-production-orders
 ```
 
-The session refuses entry unless the account is flat, both products report 200x leverage, projected free margin is at least USD 30, planned stop risk plus fee buffer is no more than USD 25, spreads are within 15%, and executable credit is at least 95% of combined mid.
+The session refuses entry unless the account is flat, both products report 200x leverage, projected free margin is at least USD 30, planned stop risk plus fee buffer is no more than USD 25, spreads are within 15%, and executable credit is at least 95% of combined mid. Entry uses concurrent 25-contract matched slices, a 20-second entry window, and up to 10 seconds of missing-leg recovery inside the combined-credit floor.
 
 ## Monitoring command
 
@@ -43,10 +43,12 @@ The active local schedule is a single `launchd` job:
 
 - Plist: `~/Library/LaunchAgents/com.rugan.delta-btc-0dte.plist`
 - Wrapper: `scripts/run_production_btc_0dte.sh`
-- Schedule: 13 July 2026 at 16:55 IST
+- Schedule: 14 July 2026 at 16:55 IST
 - Working directory: `/Users/rugan/Projects/Delta`
 - Logs: `outputs/live/production-scheduler-YYYYMMDD.log`, plus launchd stdout/stderr files
-- Command: production overrides, 100 BTC contracts per leg, wait until 17:00, 25-minute session
+- Command: production overrides, 100 BTC contracts per leg, wait until 17:00, begin forced exit at 17:24:30
+- The wrapper runs a read-only production preflight at 16:55 and sends the result to Telegram.
+- A nonzero session exit triggers an urgent Telegram message and emergency flat reconciliation.
 
 Verification:
 
@@ -55,7 +57,7 @@ launchctl print gui/$(id -u)/com.rugan.delta-btc-0dte
 launchctl list | rg 'com.rugan.delta-btc-0dte'
 ```
 
-The job is currently loaded and `not running`, which is expected before 16:55. It is not duplicated with a Codex automation.
+The job is currently loaded and `not running`, which is expected before 16:55. It is not duplicated with a Codex automation. A one-time keep-awake guard is active through 17:40 IST on 14 July; the Mac must remain powered and must not reboot or log out.
 
 ## What failed today
 
