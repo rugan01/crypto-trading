@@ -3,12 +3,13 @@ import unittest
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 from delta_live.config import Settings, TESTNET_PUBLIC_WS, TESTNET_REST
 from delta_live.engine import ExecutionEngine, State, StrategyConfig
 from delta_live.liquidity import Quote, entry_gate, tick_price
 from delta_live.manage_open import open_short_straddle
-from delta_live.session import enter_paired_slices
+from delta_live.session import close_positions, depth_aware_exit_limit, enter_paired_slices
 
 
 def quote(symbol, bid, ask, size=200, mark=None):
@@ -17,9 +18,9 @@ def quote(symbol, bid, ask, size=200, mark=None):
 
 
 class LiveEngineTests(unittest.TestCase):
-    def settings(self, directory):
+    def settings(self, directory, permissive=False):
         return Settings("testnet", True, None, None, None, None, TESTNET_REST,
-                        TESTNET_PUBLIC_WS, Path(directory))
+                        TESTNET_PUBLIC_WS, Path(directory), permissive)
 
     def test_liquidity_gate_accepts_good_quotes(self):
         result = entry_gate(quote("C", 35, 36), quote("P", 15, 16), 200,
@@ -30,6 +31,23 @@ class LiveEngineTests(unittest.TestCase):
         result = entry_gate(quote("C", 35, 50), quote("P", 15, 16), 200,
                             Decimal("0.15"), Decimal("0.80"))
         self.assertEqual(result.reason, "spread_too_wide")
+
+    def test_permissive_preflight_logs_wide_spread_without_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = ExecutionEngine(self.settings(directory, permissive=True),
+                                     StrategyConfig(size=125),
+                                     clock=lambda: datetime(2026, 7, 18, 17, 0))
+            call = {"symbol": "CALL", "quotes": {"best_bid": 10, "best_ask": 20,
+                    "bid_size": 125, "ask_size": 125}, "mark_price": 15, "timestamp": 1}
+            put = {"symbol": "PUT", "quotes": {"best_bid": 80, "best_ask": 82,
+                   "bid_size": 125, "ask_size": 125}, "mark_price": 81, "timestamp": 1}
+
+            engine.preflight(call, put)
+
+            self.assertEqual(engine.state, State.READY)
+            events = engine.log_path.read_text()
+            self.assertIn('"event": "entry_gate_warning"', events)
+            self.assertIn('"reason": "spread_too_wide"', events)
 
     def test_combined_stop_requires_persistence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -50,6 +68,145 @@ class LiveEngineTests(unittest.TestCase):
     def test_tick_rounding_is_conservative(self):
         self.assertEqual(tick_price(Decimal("15.07"), Decimal("0.1"), "sell"), "15.0")
         self.assertEqual(tick_price(Decimal("15.07"), Decimal("0.1"), "buy"), "15.1")
+
+    def test_penny_exit_limit_crosses_meaningfully_beyond_depth_price(self):
+        limit, details = depth_aware_exit_limit(
+            {"tick_size": "0.1"}, quote("CALL", 0.4, 0.5, size=125),
+            {"sell": [{"price": "0.5", "size": 125}]}, 125, 0)
+
+        self.assertEqual(limit, Decimal("1.0"))
+        self.assertTrue(details["depth_supported"])
+        self.assertTrue(details["penny_mode"])
+
+    def test_exit_limit_uses_price_at_cumulative_depth(self):
+        limit, details = depth_aware_exit_limit(
+            {"tick_size": "0.1"}, quote("CALL", 0.4, 0.5, size=50),
+            {"sell": [
+                {"price": "0.5", "size": 50},
+                {"price": "0.6", "size": 100},
+            ]}, 125, 0)
+
+        self.assertEqual(details["depth_price"], Decimal("0.6"))
+        self.assertEqual(details["depth_available"], 150)
+        self.assertEqual(limit, Decimal("1.2"))
+
+    def test_exit_submits_both_legs_in_first_round_and_reconciles_flat(self):
+        class Client:
+            def __init__(self):
+                self.payloads = []
+                self.open_sizes = {"CALL": -125, "PUT": -125}
+
+            def positions(self, asset):
+                return [
+                    {"product_symbol": symbol, "size": size}
+                    for symbol, size in self.open_sizes.items() if size
+                ]
+
+            def ticker(self, symbol):
+                bid, ask = ((0.4, 0.5) if symbol == "CALL" else (18.5, 18.7))
+                return {"symbol": symbol, "quotes": {
+                    "best_bid": bid, "best_ask": ask,
+                    "bid_size": 125, "ask_size": 125,
+                }, "mark_price": (bid + ask) / 2, "timestamp": 1}
+
+            def l2_orderbook(self, symbol, depth=50):
+                price = "0.5" if symbol == "CALL" else "18.7"
+                return {"sell": [{"price": price, "size": 125}]}
+
+            def place_order(self, payload):
+                self.payloads.append(payload)
+                symbol = "CALL" if payload["product_id"] == 1 else "PUT"
+                self.open_sizes[symbol] = 0
+                return {
+                    "id": len(self.payloads),
+                    "size": payload["size"],
+                    "unfilled_size": 0,
+                    "average_fill_price": "0.5" if symbol == "CALL" else "18.7",
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = Client()
+            engine = ExecutionEngine(
+                self.settings(directory), StrategyConfig(asset="BTC", size=125),
+                client=client, clock=lambda: datetime(2026, 7, 23, 17, 24, 30))
+
+            closed = close_positions(
+                engine,
+                [
+                    ({"id": 1, "tick_size": "0.1"}, "CALL", 125),
+                    ({"id": 2, "tick_size": "0.1"}, "PUT", 125),
+                ],
+                reconcile_positions=True,
+            )
+
+        self.assertTrue(closed)
+        self.assertEqual(len(client.payloads), 2)
+        self.assertEqual({payload["client_order_id"][-4:] for payload in client.payloads},
+                         {"x1a1", "x2a1"})
+        call_payload = next(p for p in client.payloads if p["product_id"] == 1)
+        self.assertEqual(call_payload["limit_price"], "1.0")
+        self.assertTrue(all(payload["reduce_only"] for payload in client.payloads))
+
+    def test_unfilled_penny_leg_does_not_delay_or_repeat_filled_other_leg(self):
+        class Client:
+            def __init__(self):
+                self.payloads = []
+                self.open_sizes = {"CALL": -125, "PUT": -125}
+                self.call_attempts = 0
+
+            def positions(self, asset):
+                return [
+                    {"product_symbol": symbol, "size": size}
+                    for symbol, size in self.open_sizes.items() if size
+                ]
+
+            def ticker(self, symbol):
+                bid, ask = ((0.4, 0.5) if symbol == "CALL" else (18.5, 18.7))
+                return {"symbol": symbol, "quotes": {
+                    "best_bid": bid, "best_ask": ask,
+                    "bid_size": 125, "ask_size": 125,
+                }, "mark_price": (bid + ask) / 2, "timestamp": 1}
+
+            def l2_orderbook(self, symbol, depth=50):
+                price = "0.5" if symbol == "CALL" else "18.7"
+                return {"sell": [{"price": price, "size": 125}]}
+
+            def place_order(self, payload):
+                self.payloads.append(payload)
+                if payload["product_id"] == 1:
+                    self.call_attempts += 1
+                    if self.call_attempts == 1:
+                        return {"id": 1, "size": 125, "unfilled_size": 125}
+                    self.open_sizes["CALL"] = 0
+                    return {"id": 3, "size": 125, "unfilled_size": 0,
+                            "average_fill_price": "0.5"}
+                self.open_sizes["PUT"] = 0
+                return {"id": 2, "size": 125, "unfilled_size": 0,
+                        "average_fill_price": "18.7"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = Client()
+            engine = ExecutionEngine(
+                self.settings(directory), StrategyConfig(asset="BTC", size=125),
+                client=client, clock=lambda: datetime(2026, 7, 23, 17, 24, 30))
+            with patch("delta_live.session.time.sleep"):
+                closed = close_positions(
+                    engine,
+                    [
+                        ({"id": 1, "tick_size": "0.1"}, "CALL", 125),
+                        ({"id": 2, "tick_size": "0.1"}, "PUT", 125),
+                    ],
+                    reconcile_positions=True,
+                )
+
+        self.assertTrue(closed)
+        call_payloads = [p for p in client.payloads if p["product_id"] == 1]
+        put_payloads = [p for p in client.payloads if p["product_id"] == 2]
+        self.assertEqual(len(call_payloads), 2)
+        self.assertEqual(len(put_payloads), 1)
+        self.assertTrue(call_payloads[0]["client_order_id"].endswith("x1a1"))
+        self.assertTrue(call_payloads[1]["client_order_id"].endswith("x1a2"))
+        self.assertTrue(put_payloads[0]["client_order_id"].endswith("x2a1"))
 
     def test_open_short_straddle_uses_broker_entry_prices(self):
         class Client:
@@ -109,6 +266,38 @@ class LiveEngineTests(unittest.TestCase):
         self.assertEqual(entered, 25)
         self.assertEqual(call_price, Decimal("58"))
         self.assertEqual(put_price, Decimal("44"))
+
+    def test_paired_entry_submits_full_125_contract_pair_in_one_shot(self):
+        class Client:
+            def __init__(self):
+                self.payloads = []
+
+            def ticker(self, symbol):
+                bid, ask = ((60, 61) if symbol == "CALL" else (38, 39))
+                return {"symbol": symbol, "quotes": {"best_bid": bid, "best_ask": ask,
+                        "bid_size": 200, "ask_size": 200}, "mark_price": (bid + ask) / 2,
+                        "timestamp": 1}
+
+            def place_order(self, payload):
+                self.payloads.append(payload)
+                return {"id": len(self.payloads), "size": payload["size"], "unfilled_size": 0,
+                        "average_fill_price": "58" if payload["product_id"] == 1 else "38"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = Client()
+            engine = ExecutionEngine(self.settings(directory, permissive=True),
+                                     StrategyConfig(size=125, min_credit_ratio=Decimal("0")),
+                                     client=client,
+                                     clock=lambda: datetime(2026, 7, 18, 17, 0))
+            entered, _, _ = enter_paired_slices(
+                engine, {"id": 1, "tick_size": "0.1"}, {"id": 2, "tick_size": "0.1"},
+                "CALL", "PUT", 125, quote("CALL", 60, 61), quote("PUT", 38, 39),
+                slice_size=125, entry_window=2, unmatched_grace=1)
+
+        self.assertEqual(entered, 125)
+        self.assertEqual(len(client.payloads), 2)
+        self.assertEqual({payload["size"] for payload in client.payloads}, {125})
+        self.assertEqual({payload["limit_price"] for payload in client.payloads}, {"54.0", "34.2"})
 
 
 if __name__ == "__main__":

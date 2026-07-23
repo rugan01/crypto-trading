@@ -62,6 +62,9 @@ class DeltaRESTClient:
     def ticker(self, symbol: str) -> dict[str, Any]:
         return self.request("GET", f"/v2/tickers/{symbol}")
 
+    def l2_orderbook(self, symbol: str, depth: int = 50) -> dict[str, Any]:
+        return self.request("GET", f"/v2/l2orderbook/{symbol}", {"depth": depth})
+
     def product(self, symbol: str) -> dict[str, Any]:
         return self.request("GET", f"/v2/products/{symbol}")
 

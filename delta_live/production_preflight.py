@@ -37,7 +37,8 @@ def run_preflight(asset: str, size: int, env_file: Path,
 
     call_quote, put_quote = Quote.from_ticker(call_row), Quote.from_ticker(put_row)
     gate = entry_gate(call_quote, put_quote, size, Decimal("0.15"), Decimal("0.95"))
-    if not gate.allowed:
+    integrity_failure = gate.reason in {"invalid_size", "missing_two_sided_quote"}
+    if not gate.allowed and (not settings.permissive_entry or integrity_failure):
         raise RuntimeError(f"NO TRADE: liquidity gate {gate.reason}; supported={gate.supported_size}")
     usd = next(b for b in client.balances() if b.get("asset_symbol") == "USD")
     available = Decimal(str(usd["available_balance"]))
@@ -46,17 +47,33 @@ def run_preflight(asset: str, size: int, env_file: Path,
     premium_margin = (call_quote.bid + put_quote.bid) * contract_value * size
     projected_free = available - base_margin - premium_margin - Decimal("5")
     planned_loss = (call_quote.bid + put_quote.bid) * Decimal("0.50") * contract_value * size + Decimal("5")
-    if projected_free < min_free_margin:
+    if projected_free < min_free_margin and not settings.permissive_entry:
         raise RuntimeError(f"NO TRADE: projected free margin {projected_free} below {min_free_margin}")
-    if planned_loss > max_loss:
+    if planned_loss > max_loss and not settings.permissive_entry:
         raise RuntimeError(f"NO TRADE: planned loss {planned_loss} exceeds {max_loss}")
+
+    warnings = []
+    if not gate.allowed:
+        warnings.append(f"liquidity={gate.reason}")
+    if projected_free < min_free_margin:
+        warnings.append(f"projected_free={projected_free}<{min_free_margin}")
+    if planned_loss > max_loss:
+        warnings.append(f"planned_loss={planned_loss}>{max_loss}")
 
     message = (f"Delta BTC production preflight PASS\nexpiry: {expiry}\n"
                f"ATM: {call_row['strike_price']}\nsize: {size} per leg\n"
-               f"supported depth: {gate.supported_size}\nentry remains gated at 17:00 IST")
+               f"supported depth: {gate.supported_size}\n"
+               f"mode: {'PERMISSIVE / warnings only' if settings.permissive_entry else 'GATED'}\n"
+               f"warnings: {', '.join(warnings) if warnings else 'none'}\n"
+               "entry remains scheduled for 17:00 IST")
     if not TelegramNotifier(settings.telegram_token, settings.telegram_chat_id).send(message):
-        raise RuntimeError("NO TRADE: Telegram preflight notification failed")
-    print(f"PASS expiry={expiry} strike={call_row['strike_price']} size={size} supported={gate.supported_size}")
+        if settings.permissive_entry:
+            print("WARNING Telegram preflight notification failed; execution remains scheduled")
+        else:
+            raise RuntimeError("NO TRADE: Telegram preflight notification failed")
+    print(f"PASS expiry={expiry} strike={call_row['strike_price']} size={size} "
+          f"supported={gate.supported_size} permissive={settings.permissive_entry} "
+          f"warnings={warnings}")
     return 0
 
 

@@ -56,6 +56,51 @@ def filled(order: dict) -> tuple[int, Decimal]:
     return size - remaining, price
 
 
+def depth_aware_exit_limit(product: dict, quote: Quote, orderbook: dict,
+                           remaining: int, attempt: int) -> tuple[Decimal, dict]:
+    """Return a marketable-but-bounded buy limit from cumulative ask depth.
+
+    A percentage-only retry barely moves a penny option after tick rounding.
+    For premiums at or below USD 5, the first IOC may cross as far as twice the
+    depth price. For larger premiums, it uses a 5% cushion. Later rounds widen
+    by another 5% (or two ticks) while remaining limit orders.
+    """
+    tick = Decimal(str(product["tick_size"]))
+    asks = orderbook.get("sell") or []
+    cumulative = 0
+    depth_price = quote.ask
+    levels_used = 0
+    for level in sorted(asks, key=lambda row: Decimal(str(row.get("price") or 0))):
+        price = Decimal(str(level.get("price") or 0))
+        size = int(Decimal(str(level.get("size") or 0)))
+        if price <= 0 or size <= 0:
+            continue
+        depth_price = max(depth_price, price)
+        cumulative += size
+        levels_used += 1
+        if cumulative >= remaining:
+            break
+
+    depth_supported = cumulative >= remaining
+    base = max(quote.ask, depth_price)
+    if base <= 0:
+        raise RuntimeError("Cannot construct exit limit without a positive ask")
+    retry_step = max(base * Decimal("0.05"), tick * 2)
+    if base <= Decimal("5"):
+        initial_cushion = max(base, tick * 5)
+    else:
+        initial_cushion = retry_step
+    limit = base + initial_cushion + retry_step * attempt
+    return limit, {
+        "best_ask": quote.ask,
+        "depth_price": depth_price,
+        "depth_available": cumulative,
+        "depth_supported": depth_supported,
+        "depth_levels": levels_used,
+        "penny_mode": base <= Decimal("5"),
+    }
+
+
 def enter_paired_slices(engine: ExecutionEngine, call_product: dict, put_product: dict,
                         call_symbol: str, put_symbol: str, requested_size: int,
                         initial_call: Quote, initial_put: Quote, slice_size: int = 25,
@@ -79,8 +124,11 @@ def enter_paired_slices(engine: ExecutionEngine, call_product: dict, put_product
         slice_index += 1
         call_quote = Quote.from_ticker(engine.client.ticker(call_symbol))
         put_quote = Quote.from_ticker(engine.client.ticker(put_symbol))
-        call_limit = call_quote.bid * Decimal("0.98")
-        put_limit = put_quote.bid * Decimal("0.98")
+        # Permissive production mode prioritizes completing the frozen daily
+        # sample while retaining bounded IOC orders rather than market orders.
+        entry_factor = Decimal("0.90") if engine.settings.permissive_entry else Decimal("0.98")
+        call_limit = call_quote.bid * entry_factor
+        put_limit = put_quote.bid * entry_factor
         if call_limit + put_limit < minimum_combined_credit:
             engine.event("entry_retry_wait", reason="combined_credit_below_floor",
                          call_limit=call_limit, put_limit=put_limit,
@@ -179,7 +227,12 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
     settings.assert_order_mode(allow_production=allow_production)
     if allow_production:
         os.environ["DELTA_PRODUCTION_ORDER_MODE"] = "1"
-    strategy = StrategyConfig(asset=asset, size=size, persistence_ticks=2)
+    strategy = StrategyConfig(
+        asset=asset,
+        size=size,
+        persistence_ticks=2,
+        min_credit_ratio=Decimal("0") if settings.permissive_entry else Decimal("0.95"),
+    )
     engine = ExecutionEngine(settings, strategy)
     client = engine.client
     if client.active_orders() or client.positions(asset):
@@ -207,10 +260,16 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
                      premium_margin=premium_margin, fee_buffer=5, projected_free=projected_free,
                      required_free=min_free_margin, planned_max_loss=planned_max_loss,
                      daily_loss_cap=25)
-        if projected_free < min_free_margin:
+        if projected_free < min_free_margin and not settings.permissive_entry:
             raise RuntimeError(f"NO TRADE: projected free margin {projected_free} below {min_free_margin}")
-        if planned_max_loss > Decimal("25"):
+        if planned_max_loss > Decimal("25") and not settings.permissive_entry:
             raise RuntimeError(f"NO TRADE: planned max loss {planned_max_loss} exceeds 25")
+        if settings.permissive_entry and (projected_free < min_free_margin
+                                          or planned_max_loss > Decimal("25")):
+            engine.event("risk_budget_warning", projected_free=projected_free,
+                         required_free=min_free_margin,
+                         planned_max_loss=planned_max_loss,
+                         daily_loss_cap=25, mode="telemetry_only")
     engine.event("session_start", asset=asset, expiry=expiry, minutes=minutes, size=size,
                  call=call_symbol, put=put_symbol)
 
@@ -260,38 +319,118 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
                     reason = "combined_50_stop_rest_recovery"
                     break
             time.sleep(strategy.poll_seconds)
-    finally:
+    except BaseException:
         stream.close()
+        raise
 
     engine.state = State.EXITING
     engine.event("exit_start", reason=reason)
-    ok = close_positions(engine, [(call_product, call_symbol, size), (put_product, put_symbol, size)])
+    try:
+        # Submit risk-reducing orders before waiting for the quote thread to
+        # terminate. WebSocket shutdown can take up to five seconds, which is
+        # too long to sit exposed after a confirmed 0DTE stop.
+        ok = close_positions(engine, [(call_product, call_symbol, size),
+                                      (put_product, put_symbol, size)],
+                             reconcile_positions=True)
+    finally:
+        stream.close()
     engine.state = State.CLOSED if ok else State.HALTED
     engine.event("closed" if ok else "halted", reason=reason if ok else "exit_incomplete")
     return 0 if ok else 3
 
 
-def close_positions(engine: ExecutionEngine, legs: list[tuple[dict, str, int]]) -> bool:
+def close_positions(engine: ExecutionEngine, legs: list[tuple[dict, str, int]],
+                    reconcile_positions: bool = False) -> bool:
     client = engine.client
-    all_closed = True
-    for product, symbol, initial_size in legs:
-        remaining = initial_size
-        for attempt in range(5):
-            if remaining <= 0:
-                break
+    tracked = {
+        symbol: {"product": product, "remaining": initial_size}
+        for product, symbol, initial_size in legs if initial_size > 0
+    }
+
+    if reconcile_positions and tracked:
+        try:
+            positions = client.positions(engine.strategy.asset)
+        except Exception as exc:
+            engine.event("exit_position_reconcile_failed", phase="before",
+                         error_type=type(exc).__name__)
+        else:
+            broker_sizes = {
+                str(position.get("product_symbol") or ""):
+                    max(0, -int(position.get("size") or 0))
+                for position in positions
+            }
+            for symbol, row in tracked.items():
+                planned = row["remaining"]
+                row["remaining"] = broker_sizes.get(symbol, 0)
+                engine.event("exit_position_reconciled", symbol=symbol, phase="before",
+                             planned=planned, broker_short=row["remaining"])
+
+    for attempt in range(5):
+        pending = [(symbol, row) for symbol, row in tracked.items() if row["remaining"] > 0]
+        if not pending:
+            break
+        prepared = []
+        for symbol, row in pending:
+            product = row["product"]
+            remaining = row["remaining"]
             quote = Quote.from_ticker(client.ticker(symbol))
-            # Increasing bounded limits improve fill probability without a market order.
-            limit = quote.ask * (Decimal(1) + Decimal(attempt) * Decimal("0.02"))
-            order = client.place_order(engine.order_payload(product, "buy", remaining, limit,
-                                      f"x{product['id']}{attempt}", True))
-            got, price = filled(order)
-            remaining -= got
-            engine.event("exit_order", symbol=symbol, order=order.get("id"), filled=got,
-                         fill_price=price, remaining=remaining, attempt=attempt + 1)
-            if remaining:
-                time.sleep(1)
-        if remaining:
-            all_closed = False
+            try:
+                orderbook = client.l2_orderbook(symbol, depth=50)
+            except Exception as exc:
+                orderbook = {}
+                engine.event("exit_depth_fallback", symbol=symbol, attempt=attempt + 1,
+                             error_type=type(exc).__name__)
+            limit, depth = depth_aware_exit_limit(
+                product, quote, orderbook, remaining, attempt)
+            payload = engine.order_payload(
+                product, "buy", remaining, limit, f"x{product['id']}a{attempt + 1}", True)
+            engine.event("exit_order_intent", symbol=symbol, attempt=attempt + 1,
+                         requested=remaining, limit_price=payload["limit_price"], **depth)
+            prepared.append((symbol, row, payload))
+
+        # Every remaining leg is submitted in the same retry round. An
+        # illiquid penny leg must never delay risk reduction on the other leg.
+        with ThreadPoolExecutor(max_workers=len(prepared)) as pool:
+            futures = [
+                (symbol, row, payload, pool.submit(client.place_order, payload))
+                for symbol, row, payload in prepared
+            ]
+            for symbol, row, payload, future in futures:
+                try:
+                    order = future.result()
+                except Exception as exc:
+                    engine.event("exit_order_error", symbol=symbol, attempt=attempt + 1,
+                                 requested=row["remaining"],
+                                 limit_price=payload["limit_price"],
+                                 error_type=type(exc).__name__)
+                    continue
+                got, price = filled(order)
+                row["remaining"] = max(0, row["remaining"] - got)
+                engine.event("exit_order", symbol=symbol, order=order.get("id"), filled=got,
+                             fill_price=price, remaining=row["remaining"],
+                             limit_price=payload["limit_price"], attempt=attempt + 1)
+        if any(row["remaining"] > 0 for row in tracked.values()):
+            time.sleep(1)
+
+    all_closed = all(row["remaining"] == 0 for row in tracked.values())
+    if reconcile_positions and tracked:
+        try:
+            positions = client.positions(engine.strategy.asset)
+        except Exception as exc:
+            engine.event("exit_position_reconcile_failed", phase="after",
+                         error_type=type(exc).__name__)
+            return False
+        broker_sizes = {
+            str(position.get("product_symbol") or ""):
+                max(0, -int(position.get("size") or 0))
+            for position in positions
+        }
+        for symbol, row in tracked.items():
+            broker_short = broker_sizes.get(symbol, 0)
+            engine.event("exit_position_reconciled", symbol=symbol, phase="after",
+                         expected_remaining=row["remaining"], broker_short=broker_short)
+            if broker_short:
+                all_closed = False
     return all_closed
 
 

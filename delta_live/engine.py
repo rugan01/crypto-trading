@@ -85,14 +85,22 @@ class ExecutionEngine:
         call, put = Quote.from_ticker(call_row), Quote.from_ticker(put_row)
         gate = entry_gate(call, put, self.strategy.size, self.strategy.max_spread_pct,
                           self.strategy.min_credit_ratio)
-        if not gate.allowed:
+        integrity_failure = gate.reason in {"invalid_size", "missing_two_sided_quote"}
+        if not gate.allowed and (not self.settings.permissive_entry or integrity_failure):
             self.state = State.NO_TRADE
             self.event("no_trade", reason=gate.reason, supported_size=gate.supported_size,
                        executable_credit=gate.executable_credit, mid_credit=gate.mid_credit)
             raise RuntimeError(f"Liquidity gate failed: {gate.reason}")
         self.state = State.READY
+        if not gate.allowed:
+            self.event("entry_gate_warning", reason=gate.reason,
+                       supported_size=gate.supported_size,
+                       executable_credit=gate.executable_credit,
+                       mid_credit=gate.mid_credit,
+                       mode="telemetry_only")
         self.event("ready", call=call.symbol, put=put.symbol, size=self.strategy.size,
-                   executable_credit=gate.executable_credit)
+                   executable_credit=gate.executable_credit,
+                   permissive_entry=self.settings.permissive_entry)
         return call, put
 
     def order_payload(self, product: dict, side: str, size: int, price: Decimal,

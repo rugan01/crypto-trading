@@ -36,6 +36,7 @@ class Settings:
     rest_url: str
     public_ws_url: str
     log_dir: Path
+    permissive_entry: bool = False
 
     @classmethod
     def load(cls, env_file: Path = Path(".env")) -> "Settings":
@@ -53,7 +54,8 @@ class Settings:
             rest, ws = PRODUCTION_REST, PRODUCTION_PUBLIC_WS
         return cls(environment, env_bool("DELTA_DRY_RUN", True), key, secret,
                    os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"),
-                   rest, ws, Path(os.getenv("DELTA_LOG_DIR", "outputs/live")))
+                   rest, ws, Path(os.getenv("DELTA_LOG_DIR", "outputs/live")),
+                   env_bool("DELTA_PERMISSIVE_ENTRY", False))
 
     def assert_order_mode(self, allow_production: bool = False) -> None:
         if self.environment == "production" and not allow_production:

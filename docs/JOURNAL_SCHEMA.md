@@ -97,9 +97,9 @@ Private files under `outputs/` are gitignored because they can contain account-s
 8. At 18:00 IST, send the summary and any anomaly to Telegram.
 9. Weekly, aggregate win rate, net expectancy, fee drag, stop frequency, liquidity failures and execution quality without changing the frozen production rule midweek.
 
-## Production rule for 12 July 2026
+## Current production rule
 
-- BTC, 100 contracts per leg, common ATM 0DTE call and put.
+- BTC, 125 contracts per leg, common ATM 0DTE call and put, entered as one concurrent matched pair.
 - Entry decision at 17:00 IST; mandatory exit begins 17:24:30 and completes by 17:25.
 - Both products must report exactly 200x leverage.
 - Combined executable stop is 1.5 times actual combined fill, persisted twice.
