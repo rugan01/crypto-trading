@@ -30,10 +30,12 @@ def run_preflight(asset: str, size: int, env_file: Path,
     call_row, put_row = engine.select_atm(chain, spot)
     call_product = client.product(call_row["symbol"])
     put_product = client.product(put_row["symbol"])
+    leverages = []
     for product in (call_product, put_product):
         leverage = Decimal(str(client.order_leverage(int(product["id"]))["leverage"]))
-        if leverage != Decimal("200"):
-            raise RuntimeError(f"NO TRADE: {product['symbol']} leverage is {leverage}, not 200")
+        if leverage <= 0:
+            raise RuntimeError(f"NO TRADE: {product['symbol']} returned invalid leverage {leverage}")
+        leverages.append(leverage)
 
     call_quote, put_quote = Quote.from_ticker(call_row), Quote.from_ticker(put_row)
     gate = entry_gate(call_quote, put_quote, size, Decimal("0.15"), Decimal("0.95"))
@@ -42,11 +44,21 @@ def run_preflight(asset: str, size: int, env_file: Path,
         raise RuntimeError(f"NO TRADE: liquidity gate {gate.reason}; supported={gate.supported_size}")
     usd = next(b for b in client.balances() if b.get("asset_symbol") == "USD")
     available = Decimal(str(usd["available_balance"]))
-    contract_value = Decimal(str(call_product["contract_value"]))
-    base_margin = spot * contract_value * size / Decimal("200") * 2
-    premium_margin = (call_quote.bid + put_quote.bid) * contract_value * size
+    call_contract_value = Decimal(str(call_product["contract_value"]))
+    put_contract_value = Decimal(str(put_product["contract_value"]))
+    base_margin = (
+        spot * call_contract_value * size / leverages[0]
+        + spot * put_contract_value * size / leverages[1]
+    )
+    premium_margin = (
+        call_quote.bid * call_contract_value * size
+        + put_quote.bid * put_contract_value * size
+    )
     projected_free = available - base_margin - premium_margin - Decimal("5")
-    planned_loss = (call_quote.bid + put_quote.bid) * Decimal("0.50") * contract_value * size + Decimal("5")
+    planned_loss = (
+        call_quote.bid * call_contract_value
+        + put_quote.bid * put_contract_value
+    ) * Decimal("0.50") * size + Decimal("5")
     if projected_free < min_free_margin and not settings.permissive_entry:
         raise RuntimeError(f"NO TRADE: projected free margin {projected_free} below {min_free_margin}")
     if planned_loss > max_loss and not settings.permissive_entry:
@@ -62,6 +74,7 @@ def run_preflight(asset: str, size: int, env_file: Path,
 
     message = (f"Delta BTC production preflight PASS\nexpiry: {expiry}\n"
                f"ATM: {call_row['strike_price']}\nsize: {size} per leg\n"
+               f"leverage: call {leverages[0]}x / put {leverages[1]}x\n"
                f"supported depth: {gate.supported_size}\n"
                f"mode: {'PERMISSIVE / warnings only' if settings.permissive_entry else 'GATED'}\n"
                f"warnings: {', '.join(warnings) if warnings else 'none'}\n"
@@ -72,6 +85,7 @@ def run_preflight(asset: str, size: int, env_file: Path,
         else:
             raise RuntimeError("NO TRADE: Telegram preflight notification failed")
     print(f"PASS expiry={expiry} strike={call_row['strike_price']} size={size} "
+          f"leverage={leverages[0]}/{leverages[1]} "
           f"supported={gate.supported_size} permissive={settings.permissive_entry} "
           f"warnings={warnings}")
     return 0

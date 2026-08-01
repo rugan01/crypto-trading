@@ -5,8 +5,8 @@ cd /Users/rugan/Projects/Delta
 mkdir -p outputs/live
 exec >> outputs/live/production-scheduler-$(date +%Y%m%d).log 2>&1
 
-BTC_SIZE="${DELTA_BTC_SIZE:-125}"
-BTC_SLICE_SIZE="${DELTA_BTC_SLICE_SIZE:-125}"
+BTC_SIZE="${DELTA_BTC_SIZE:-150}"
+BTC_SLICE_SIZE="${DELTA_BTC_SLICE_SIZE:-150}"
 PERMISSIVE_ENTRY="${DELTA_PERMISSIVE_ENTRY:-true}"
 
 echo "scheduler_started $(date '+%Y-%m-%dT%H:%M:%S%z')"

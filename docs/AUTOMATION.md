@@ -21,12 +21,12 @@ DELTA_ENV=production \
 DELTA_DRY_RUN=false \
 DELTA_PRODUCTION_ACK=LIVE_ORDERS_AUTHORIZED \
 python -m delta_live.session \
-  --asset BTC --size 125 --minutes 25 --start-at 17:00:00 \
-  --slice-size 125 \
+  --asset BTC --size 150 --minutes 25 --start-at 17:00:00 \
+  --slice-size 150 \
   --confirm-production-orders
 ```
 
-The current production target is 125 contracts per leg, submitted as one concurrent matched 125-contract call/put pair. `DELTA_PERMISSIVE_ENTRY=true` makes the 15% spread, displayed depth, 95% credit, projected-free-margin and modelled-loss checks telemetry-only so they are recorded for later analysis without cancelling the daily entry. Entry uses bounded IOC limits up to 10% through the displayed bid. Credentials, duplicate/open campaign protection, valid two-sided quotes, paired-leg recovery, stop monitoring, forced exit and emergency flatten remain mandatory. The 20-second entry window and up to 10 seconds of missing-leg recovery remain active so a partial or missing leg is completed or flattened without retaining unmatched exposure.
+The current production target is 150 contracts per leg, submitted as one concurrent matched 150-contract call/put pair. `DELTA_PERMISSIVE_ENTRY=true` makes the 15% spread, displayed depth, 95% credit, projected-free-margin and modelled-loss checks telemetry-only so they are recorded for later analysis without cancelling the daily entry. Entry uses bounded IOC limits up to 10% through the displayed bid. Credentials, duplicate/open campaign protection, valid two-sided quotes, paired-leg recovery, stop monitoring, forced exit and emergency flatten remain mandatory. The 20-second entry window and up to 10 seconds of missing-leg recovery remain active so a partial or missing leg is completed or flattened without retaining unmatched exposure.
 
 At exit, the session first reconciles the current broker size of each campaign leg. It reads cumulative L2 ask depth for the remaining quantity and submits every live leg concurrently as reduce-only IOC limits. Options priced at USD 5 or less receive a meaningful tick-aware cushion—up to twice the depth price on the first attempt—because a 2% ladder can round back to the same penny-option tick. Larger premiums start with a 5% cushion. Limits remain bounded, widen on subsequent rounds, and fall back to the ticker ask if L2 is unavailable. Final broker positions are reconciled again before the session may report success; emergency flatten remains the outer recovery layer.
 
@@ -50,7 +50,7 @@ The active local schedule is a single `launchd` job:
 - Schedule: every calendar day at 16:55 IST, including weekends
 - Working directory: `/Users/rugan/Projects/Delta`
 - Logs: `outputs/live/production-scheduler-YYYYMMDD.log`, plus launchd stdout/stderr files
-- Command: production overrides, one concurrent matched submission of 125 BTC contracts per leg, wait until 17:00, begin forced exit at 17:24:30
+- Command: production overrides, one concurrent matched submission of 150 BTC contracts per leg, wait until 17:00, begin forced exit at 17:24:30
 - The wrapper runs a read-only production preflight at 16:55 and sends the result to Telegram.
 - A nonzero session exit triggers an urgent Telegram message and emergency flat reconciliation.
 
