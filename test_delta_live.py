@@ -259,13 +259,14 @@ class LiveEngineTests(unittest.TestCase):
                                      client=Client(), clock=lambda: datetime(2026, 7, 13, 17, 0))
             initial_call = quote("CALL", 60, 61, size=100)
             initial_put = quote("PUT", 38, 39, size=100)
-            entered, call_price, put_price = enter_paired_slices(
+            entered, call_price, put_price, call_size, put_size = enter_paired_slices(
                 engine, {"id": 1, "tick_size": "0.1"}, {"id": 2, "tick_size": "0.1"},
                 "CALL", "PUT", 25, initial_call, initial_put, slice_size=25,
                 entry_window=2, unmatched_grace=1)
         self.assertEqual(entered, 25)
         self.assertEqual(call_price, Decimal("58"))
         self.assertEqual(put_price, Decimal("44"))
+        self.assertEqual((call_size, put_size), (25, 25))
 
     def test_paired_entry_submits_full_125_contract_pair_in_one_shot(self):
         class Client:
@@ -289,15 +290,75 @@ class LiveEngineTests(unittest.TestCase):
                                      StrategyConfig(size=125, min_credit_ratio=Decimal("0")),
                                      client=client,
                                      clock=lambda: datetime(2026, 7, 18, 17, 0))
-            entered, _, _ = enter_paired_slices(
+            entered, _, _, call_size, put_size = enter_paired_slices(
                 engine, {"id": 1, "tick_size": "0.1"}, {"id": 2, "tick_size": "0.1"},
                 "CALL", "PUT", 125, quote("CALL", 60, 61), quote("PUT", 38, 39),
                 slice_size=125, entry_window=2, unmatched_grace=1)
 
         self.assertEqual(entered, 125)
+        self.assertEqual((call_size, put_size), (125, 125))
         self.assertEqual(len(client.payloads), 2)
         self.assertEqual({payload["size"] for payload in client.payloads}, {125})
         self.assertEqual({payload["limit_price"] for payload in client.payloads}, {"54.0", "34.2"})
+
+    def test_unfillable_leg_is_retained_not_flattened(self):
+        """The 2026-08-01 failure: call fills, put never does.
+
+        The filled call must be KEPT, not bought back. Round-tripping it cost
+        $1.03 of commission plus $0.60 of slippage for no risk benefit.
+        """
+        class Client:
+            def __init__(self):
+                self.payloads = []
+
+            def ticker(self, symbol):
+                bid, ask = ((81, 85) if symbol == "CALL" else (Decimal("0.9"), 3))
+                return {"symbol": symbol, "quotes": {"best_bid": bid, "best_ask": ask,
+                        "bid_size": 500, "ask_size": 500}, "mark_price": bid,
+                        "timestamp": 1}
+
+            def place_order(self, payload):
+                self.payloads.append(payload)
+                if payload["product_id"] == 1:            # call fills in full
+                    return {"id": len(self.payloads), "size": payload["size"],
+                            "unfilled_size": 0, "average_fill_price": "81"}
+                return {"id": len(self.payloads), "size": payload["size"],
+                        "unfilled_size": payload["size"]}  # put never fills
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = Client()
+            engine = ExecutionEngine(self.settings(directory, permissive=True),
+                                     StrategyConfig(size=150, min_credit_ratio=Decimal("0")),
+                                     client=client,
+                                     clock=lambda: datetime(2026, 8, 1, 17, 0))
+            entered, call_price, put_price, call_size, put_size = enter_paired_slices(
+                engine, {"id": 1, "tick_size": "0.1"}, {"id": 2, "tick_size": "0.1"},
+                "CALL", "PUT", 150, quote("CALL", 81, 85), quote("PUT", Decimal("0.9"), 3),
+                slice_size=150, entry_window=2, unmatched_grace=1)
+
+        # The call is retained at full size; no pair was ever formed.
+        self.assertEqual((call_size, put_size), (150, 0))
+        self.assertEqual(entered, 0)
+        self.assertEqual(call_price, Decimal("81"))
+        # Critically: no BUY order was ever submitted against the filled call.
+        buys = [p for p in client.payloads if p["side"] == "buy"]
+        self.assertEqual(buys, [], "filled leg must never be flattened to restore symmetry")
+
+    def test_single_leg_stop_ignores_the_unfilled_leg(self):
+        """Stop level and buyback must both reflect only the leg actually held."""
+        with tempfile.TemporaryDirectory() as directory:
+            engine = ExecutionEngine(self.settings(directory), StrategyConfig(size=150),
+                                     client=None, clock=lambda: datetime(2026, 8, 1, 17, 0))
+            engine.live_call, engine.live_put = True, False
+            engine.record_entry(Decimal("81"), Decimal(0))
+            self.assertEqual(engine.entry_credit, Decimal("81"))
+            self.assertEqual(engine.stop_level, Decimal("121.5"))   # 81 * 1.5
+            # A rich ask on the leg we do NOT hold must not trigger the stop.
+            self.assertFalse(engine.observe_stop(quote("CALL", 60, 61), quote("PUT", 900, 999)))
+            self.assertFalse(engine.observe_stop(quote("CALL", 60, 61), quote("PUT", 900, 999)))
+            # The held leg breaching 121.5 for two ticks must trigger it.
+            self.assertFalse(engine.observe_stop(quote("CALL", 120, 125), quote("PUT", 0, 0)))
+            self.assertTrue(engine.observe_stop(quote("CALL", 120, 125), quote("PUT", 0, 0)))
 
 
 if __name__ == "__main__":

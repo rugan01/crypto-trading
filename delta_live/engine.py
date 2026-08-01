@@ -53,6 +53,10 @@ class ExecutionEngine:
         self.state = State.STARTING
         self.entry_credit: Decimal | None = None
         self.stop_hits = 0
+        # Which legs are actually held. A single-sided fill is retained rather
+        # than flattened, so the risk loop must know what it is protecting.
+        self.live_call = True
+        self.live_put = True
         settings.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = settings.log_dir / f"events-{self.clock():%Y%m%d}.jsonl"
 
@@ -128,7 +132,13 @@ class ExecutionEngine:
     def observe_stop(self, call: Quote, put: Quote) -> bool:
         if self.state != State.OPEN:
             return False
-        executable_buyback = call.ask + put.ask
+        # A leg that was never filled contributes no buyback cost. Including its
+        # ask would inflate the stop trigger and stop a single-leg position early.
+        executable_buyback = Decimal(0)
+        if self.live_call:
+            executable_buyback += call.ask
+        if self.live_put:
+            executable_buyback += put.ask
         self.stop_hits = self.stop_hits + 1 if executable_buyback >= self.stop_level else 0
         self.event("risk_tick", executable_buyback=executable_buyback, stop_level=self.stop_level,
                    consecutive_hits=self.stop_hits, call_mark=call.mark, put_mark=put.mark)

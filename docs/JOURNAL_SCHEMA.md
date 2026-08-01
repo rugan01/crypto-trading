@@ -99,9 +99,52 @@ Private files under `outputs/` are gitignored because they can contain account-s
 
 ## Current production rule
 
-- BTC, 125 contracts per leg, common ATM 0DTE call and put, entered as one concurrent matched pair.
+- BTC, 150 contracts per leg, common ATM 0DTE call and put, entered as one concurrent matched pair.
 - Entry decision at 17:00 IST; mandatory exit begins 17:24:30 and completes by 17:25.
 - Both products must report exactly 200x leverage.
 - Combined executable stop is 1.5 times actual combined fill, persisted twice.
 - Hard daily-loss cap is USD 25; minimum post-entry free margin is USD 30.
 - Any failed liquidity, margin, leverage, data-freshness or reconciliation check is `NO_TRADE`.
+
+### Unmatched leg: retain, never round-trip (effective 1 August 2026)
+
+If one leg fills and the other cannot, the filled leg is **kept** and traded
+single-sided. It is never bought back to restore symmetry.
+
+Closing a good fill to repair a broken pair is a guaranteed loss taken to avoid
+an uncertain one: it pays two lots of commission plus the spread and surrenders
+the entry price, while a single short leg still carries a defined stop. In the
+session that prompted this rule the abort cost more in commission and slippage
+than the whole day's edge, and the same contract was re-sold minutes later at a
+materially worse price than the one that had just been closed.
+
+The retained leg keeps the normal protections:
+
+- stop at **1.5x the credit of the leg actually held** — the unfilled leg
+  contributes nothing to entry credit and nothing to the buyback comparison;
+- the same 17:24:30 forced exit;
+- normal broker reconciliation at exit.
+
+`entry_unfilled` is now raised only when **both** legs are empty. A single-sided
+fill emits `single_leg_session` and is a live position, not a failed entry.
+
+This **supersedes** the 14 July 2026 session note, which recommended cancelling
+the whole campaign when a leg's minimum-credit gate failed. That earlier
+recommendation is retained in `docs/SESSIONS/` as a historical record only.
+
+### Strike selection
+
+The selector takes the **nearest** strike to spot, which maximises extrinsic
+value; this is correct and unchanged. With 200-point strike spacing, spot sits
+50-100 points from the nearest strike roughly half the time, and at that
+distance one leg is worth almost nothing. Moving to the next strike out does not
+help — it lowers extrinsic value and simply moves the worthless leg to the other
+side. Those days are single-leg directional sessions by nature, which is what
+the retain rule above is for.
+
+A `market_context` event is recorded every session — spot, strike, distance,
+per-leg bid/ask and spread, combined credit, intrinsic, **extrinsic**, mark vol
+and open interest — so any future skip/size rule is derived from data rather
+than from a small sample. No gate is currently driven by extrinsic value: across
+the sessions logged so far the relationship to outcome is not established, and
+the sample is far too small to justify one.

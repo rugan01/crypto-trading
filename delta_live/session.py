@@ -105,12 +105,20 @@ def enter_paired_slices(engine: ExecutionEngine, call_product: dict, put_product
                         call_symbol: str, put_symbol: str, requested_size: int,
                         initial_call: Quote, initial_put: Quote, slice_size: int = 25,
                         entry_window: float = 20, unmatched_grace: float = 10
-                        ) -> tuple[int, Decimal, Decimal]:
-    """Enter matched slices, retrying a missing leg before flattening it.
+                        ) -> tuple[int, Decimal, Decimal, int, int]:
+    """Enter matched slices, retrying a missing leg but never flattening a fill.
 
     A completed matched slice is retained. An unmatched slice is retried against
-    fresh quotes for ``unmatched_grace`` seconds and is flattened only if the
-    missing leg still cannot be completed inside the combined-credit floor.
+    fresh quotes for ``unmatched_grace`` seconds. If the missing leg still cannot
+    be filled, the leg that DID fill is kept and traded single-sided rather than
+    round-tripped out: closing a good fill to "repair" symmetry pays two lots of
+    commission plus the spread and surrenders the entry price, which on
+    2026-08-01 cost $1.03 of commission, $0.60 of slippage, and a re-entry 13
+    points worse on the same contract. The retained leg stays under the normal
+    stop and forced-exit rules.
+
+    Returns ``(matched_pairs, call_avg_price, put_avg_price, call_size, put_size)``
+    where the sizes are the live short quantity per leg and may differ.
     """
     deadline = time.monotonic() + entry_window
     minimum_combined_credit = (initial_call.mid + initial_put.mid) * engine.strategy.min_credit_ratio
@@ -118,6 +126,9 @@ def enter_paired_slices(engine: ExecutionEngine, call_product: dict, put_product
     call_notional = Decimal(0)
     put_notional = Decimal(0)
     slice_index = 0
+    # Live short quantity per leg. These diverge when one leg cannot be filled.
+    call_live = 0
+    put_live = 0
 
     while matched < requested_size and time.monotonic() < deadline:
         target = min(slice_size, requested_size - matched)
@@ -183,8 +194,13 @@ def enter_paired_slices(engine: ExecutionEngine, call_product: dict, put_product
                 if got:
                     put_price = ((put_price * put_filled) + (price * got)) / (put_filled + got)
                 put_filled += got
+            # limit/bid are logged so an unfilled leg can be diagnosed after the
+            # fact: without them there is no way to tell "priced too high" from
+            # "no resting bid" once the book has moved on.
             engine.event("entry_leg_retry", slice=slice_index, attempt=attempt,
                          missing_leg=side_name, order=retry.get("id"), filled=got,
+                         limit=limit, bid=quote.bid, ask=quote.ask,
+                         bid_size=quote.bid_size, needed=need,
                          call_filled=call_filled, put_filled=put_filled)
             if call_filled != put_filled:
                 time.sleep(0.5)
@@ -196,17 +212,26 @@ def enter_paired_slices(engine: ExecutionEngine, call_product: dict, put_product
             put_notional += put_price * paired
         call_excess, put_excess = call_filled - paired, put_filled - paired
         if call_excess or put_excess:
+            # RETAIN the excess. Do not flatten a good fill to restore symmetry.
+            if call_excess:
+                call_notional += call_price * call_excess
+            if put_excess:
+                put_notional += put_price * put_excess
+            call_live += call_filled
+            put_live += put_filled
             engine.event("entry_slice_unmatched", slice=slice_index,
-                         call_excess=call_excess, put_excess=put_excess)
-            close_positions(engine, [(call_product, call_symbol, call_excess),
-                                     (put_product, put_symbol, put_excess)])
+                         call_excess=call_excess, put_excess=put_excess,
+                         action="retained_single_leg",
+                         note="unpaired leg kept under normal stop and forced-exit rules")
             break
+        call_live += call_filled
+        put_live += put_filled
         if call_filled == 0 and put_filled == 0:
             time.sleep(0.5)
 
-    if matched == 0:
-        return 0, Decimal(0), Decimal(0)
-    return matched, call_notional / matched, put_notional / matched
+    call_avg = call_notional / call_live if call_live else Decimal(0)
+    put_avg = put_notional / put_live if put_live else Decimal(0)
+    return matched, call_avg, put_avg, call_live, put_live
 
 
 def nearest_chain(client: DeltaRESTClient, asset: str) -> tuple[str, list[dict]]:
@@ -222,7 +247,8 @@ def nearest_chain(client: DeltaRESTClient, asset: str) -> tuple[str, list[dict]]
 def run_session(asset: str, size: int, minutes: int, env_file: Path,
                 allow_production: bool = False, min_free_margin: Decimal = Decimal("30"),
                 slice_size: int = 25, entry_window: float = 20,
-                unmatched_grace: float = 10, exit_at: str | None = None) -> int:
+                unmatched_grace: float = 10, exit_at: str | None = None,
+                min_leg_bid: Decimal = Decimal("5")) -> int:
     settings = Settings.load(env_file)
     settings.assert_order_mode(allow_production=allow_production)
     if allow_production:
@@ -270,6 +296,48 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
                          required_free=min_free_margin,
                          planned_max_loss=planned_max_loss,
                          daily_loss_cap=25, mode="telemetry_only")
+    # Market scenario snapshot, recorded every session whether or not it trades.
+    # The strike selector already picks the nearest strike, which is provably the
+    # right choice; what actually varies day to day is how far spot sits from it
+    # and how much EXTRINSIC value that leaves to harvest. Intrinsic is not edge -
+    # selling it is a directional bet. Twelve sessions is too few to gate on, so
+    # this records the inputs now and the rule gets decided on real data later.
+    try:
+        strike = Decimal(str(call_row.get("strike_price") or 0))
+        distance = spot - strike
+        combined_bid = call_quote.bid + put_quote.bid
+        intrinsic = abs(distance)
+        engine.event(
+            "market_context",
+            spot=spot, strike=strike, distance=distance,
+            distance_pct=(distance / spot * 100) if spot else Decimal(0),
+            strike_spacing_note="one leg goes near-worthless as |distance| approaches "
+                                "half the strike spacing",
+            call_bid=call_quote.bid, call_ask=call_quote.ask,
+            put_bid=put_quote.bid, put_ask=put_quote.ask,
+            combined_bid=combined_bid,
+            intrinsic=intrinsic,
+            extrinsic=combined_bid - intrinsic,
+            extrinsic_pct_of_credit=((combined_bid - intrinsic) / combined_bid * 100)
+                                    if combined_bid else Decimal(0),
+            call_spread_pct=call_quote.spread_pct, put_spread_pct=put_quote.spread_pct,
+            call_mark_vol=call_row.get("mark_vol"), put_mark_vol=put_row.get("mark_vol"),
+            call_oi=call_row.get("oi"), put_oi=put_row.get("oi"),
+            expiry=expiry,
+        )
+    except Exception as exc:  # telemetry must never block a trade
+        engine.event("market_context_failed", error_type=type(exc).__name__, error=str(exc))
+
+    # Advisory only. A leg quoted below the floor is very likely to be unfillable
+    # in size and contributes almost nothing to the credit, but this must never
+    # block the trade - it is a flag to review the strike choice, not a gate.
+    for leg_name, leg_quote in (("call", call_quote), ("put", put_quote)):
+        if leg_quote.bid < min_leg_bid:
+            engine.event("leg_bid_below_floor", leg=leg_name, symbol=leg_quote.symbol,
+                         bid=leg_quote.bid, floor=min_leg_bid, mode="advisory_only",
+                         note="thin leg: expect fill difficulty and negligible credit "
+                              "contribution; a single-leg session is the likely outcome")
+
     engine.event("session_start", asset=asset, expiry=expiry, minutes=minutes, size=size,
                  call=call_symbol, put=put_symbol)
 
@@ -279,17 +347,29 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
     engine.event("entry_intent", call_bid=call_quote.bid, put_bid=put_quote.bid,
                  requested_size=size, slice_size=slice_size, entry_window=entry_window,
                  unmatched_grace=unmatched_grace)
-    entered_size, call_fill, put_fill = enter_paired_slices(
+    entered_size, call_fill, put_fill, call_size, put_size = enter_paired_slices(
         engine, call_product, put_product, call_symbol, put_symbol, size,
         call_quote, put_quote, slice_size, entry_window, unmatched_grace)
-    if entered_size == 0:
+    # A single-sided fill is a live position, not a failed entry. Only a session
+    # with nothing filled on either leg is unfilled.
+    if call_size == 0 and put_size == 0:
         engine.halt("entry_unfilled")
         return 2
-    if entered_size < size:
-        engine.event("entry_reduced_size", requested_size=size, entered_size=entered_size)
-        engine.strategy = StrategyConfig(asset=asset, size=entered_size, persistence_ticks=2)
-    size = entered_size
-    engine.record_entry(call_fill, put_fill)
+    engine.live_call = call_size > 0
+    engine.live_put = put_size > 0
+    position_size = max(call_size, put_size)
+    if not (engine.live_call and engine.live_put):
+        engine.event("single_leg_session", live_leg="call" if engine.live_call else "put",
+                     call_size=call_size, put_size=put_size,
+                     entry_price=call_fill if engine.live_call else put_fill,
+                     note="unpaired leg retained deliberately; stop and forced exit still apply")
+    if position_size < size:
+        engine.event("entry_reduced_size", requested_size=size, entered_size=position_size)
+    engine.strategy = StrategyConfig(asset=asset, size=position_size, persistence_ticks=2)
+    size = position_size
+    # Credit and therefore the stop level reflect only the legs actually held.
+    engine.record_entry(call_fill if engine.live_call else Decimal(0),
+                        put_fill if engine.live_put else Decimal(0))
 
     book = QuoteBook()
     stream = PublicQuoteStream(settings.public_ws_url, [call_symbol, put_symbol], book.update)
@@ -329,8 +409,8 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
         # Submit risk-reducing orders before waiting for the quote thread to
         # terminate. WebSocket shutdown can take up to five seconds, which is
         # too long to sit exposed after a confirmed 0DTE stop.
-        ok = close_positions(engine, [(call_product, call_symbol, size),
-                                      (put_product, put_symbol, size)],
+        ok = close_positions(engine, [(call_product, call_symbol, call_size),
+                                      (put_product, put_symbol, put_size)],
                              reconcile_positions=True)
     finally:
         stream.close()
@@ -444,6 +524,9 @@ def main() -> int:
     p.add_argument("--slice-size", type=int, default=25)
     p.add_argument("--entry-window", type=float, default=20)
     p.add_argument("--unmatched-grace", type=float, default=10)
+    p.add_argument("--min-leg-bid", type=Decimal, default=Decimal("5"),
+                   help="Advisory floor: warn when a leg's bid is below this. "
+                        "Never blocks entry.")
     p.add_argument("--env-file", type=Path, default=Path(".env"))
     p.add_argument("--confirm-sandbox-orders", action="store_true")
     p.add_argument("--confirm-production-orders", action="store_true")
@@ -467,7 +550,8 @@ def main() -> int:
     return run_session(args.asset, args.size, args.minutes, args.env_file,
                        allow_production=args.confirm_production_orders,
                        slice_size=args.slice_size, entry_window=args.entry_window,
-                       unmatched_grace=args.unmatched_grace, exit_at=args.exit_at)
+                       unmatched_grace=args.unmatched_grace, exit_at=args.exit_at,
+                       min_leg_bid=args.min_leg_bid)
 
 
 if __name__ == "__main__":
