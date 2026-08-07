@@ -19,8 +19,8 @@ def run_preflight(asset: str, size: int, env_file: Path,
     if settings.environment != "production":
         raise RuntimeError("Production preflight requires DELTA_ENV=production")
     client = DeltaRESTClient(settings)
-    if client.active_orders():
-        raise RuntimeError("NO TRADE: active orders already exist")
+    if client.active_orders_for(asset):
+        raise RuntimeError(f"NO TRADE: active {asset} orders already exist")
     if client.positions(asset):
         raise RuntimeError(f"NO TRADE: open {asset} positions already exist")
 

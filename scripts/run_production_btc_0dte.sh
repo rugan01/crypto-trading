@@ -5,8 +5,12 @@ cd /Users/rugan/Projects/Delta
 mkdir -p outputs/live
 exec >> outputs/live/production-scheduler-$(date +%Y%m%d).log 2>&1
 
-BTC_SIZE="${DELTA_BTC_SIZE:-150}"
-BTC_SLICE_SIZE="${DELTA_BTC_SLICE_SIZE:-150}"
+# 100, not 150. At BTC ~64,600 a 150-lot straddle needs $96.89 of base margin
+# against an account that held $83.00 on 2026-08-06, so the scheduled run would
+# size into a margin failure. Raise this only after confirming available balance
+# covers base margin at the prevailing spot.
+BTC_SIZE="${DELTA_BTC_SIZE:-100}"
+BTC_SLICE_SIZE="${DELTA_BTC_SLICE_SIZE:-100}"
 PERMISSIVE_ENTRY="${DELTA_PERMISSIVE_ENTRY:-true}"
 
 echo "scheduler_started $(date '+%Y-%m-%dT%H:%M:%S%z')"

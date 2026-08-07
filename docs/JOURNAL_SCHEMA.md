@@ -99,7 +99,10 @@ Private files under `outputs/` are gitignored because they can contain account-s
 
 ## Current production rule
 
-- BTC, 150 contracts per leg, common ATM 0DTE call and put, entered as one concurrent matched pair.
+- BTC, 100 contracts per leg, common ATM 0DTE call and put, entered as one concurrent matched pair.
+  Reduced from 150 on 2026-08-06: at BTC ~64,600 a 150-lot straddle needs $96.89 of base margin
+  against $83.00 available. Raise only after confirming available balance covers base margin at
+  the prevailing spot.
 - Entry decision at 17:00 IST; mandatory exit begins 17:24:30 and completes by 17:25.
 - Both products must report exactly 200x leverage.
 - Combined executable stop is 1.5 times actual combined fill, persisted twice.
@@ -131,6 +134,27 @@ fill emits `single_leg_session` and is a live position, not a failed entry.
 This **supersedes** the 14 July 2026 session note, which recommended cancelling
 the whole campaign when a leg's minimum-credit gate failed. That earlier
 recommendation is retained in `docs/SESSIONS/` as a historical record only.
+
+### Entry guards are scoped to the traded asset (effective 6 August 2026)
+
+`production_preflight` and `run_session` both refuse to start when leftover
+state exists. That check is now **asset-scoped** via
+`DeltaRESTClient.active_orders_for(asset)`, not account-wide.
+
+On 6 August a reduce-only protective stop on `P-XAUT-4200-070826` aborted both
+gates while the BTC book was completely flat. A stop on an unrelated underlying
+is not leftover state for a BTC straddle, and blocking on it means an unrelated
+hedge elsewhere in the account silently cancels the day's session.
+
+Matching is on the asset appearing anywhere in the product symbol, so it covers
+both options (`C-BTC-64600-060826`) and perpetuals (`BTCUSD`). A BTC perp
+carries delta on the same underlying and **is** genuine leftover state, even
+though it does not use the hyphenated option format. `client.positions(asset)`
+was already correctly scoped and is unchanged.
+
+Covered by `ActiveOrderScopeTests` — unrelated asset does not block, same-asset
+option blocks, same-asset perpetual blocks, empty book does not block, and
+null/missing symbols are ignored rather than raising.
 
 ### Strike selection
 

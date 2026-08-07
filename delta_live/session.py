@@ -261,8 +261,8 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
     )
     engine = ExecutionEngine(settings, strategy)
     client = engine.client
-    if client.active_orders() or client.positions(asset):
-        raise RuntimeError("Refusing to start: demo account has active orders or positions")
+    if client.active_orders_for(asset) or client.positions(asset):
+        raise RuntimeError(f"Refusing to start: active {asset} orders or positions already exist")
 
     expiry, chain = nearest_chain(client, asset)
     spot = Decimal(str(next(r["spot_price"] for r in chain if r.get("spot_price"))))

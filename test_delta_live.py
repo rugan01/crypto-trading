@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+from delta_live.client import DeltaRESTClient
 from delta_live.config import Settings, TESTNET_PUBLIC_WS, TESTNET_REST
 from delta_live.engine import ExecutionEngine, State, StrategyConfig
 from delta_live.liquidity import Quote, entry_gate, tick_price
@@ -359,6 +360,53 @@ class LiveEngineTests(unittest.TestCase):
             # The held leg breaching 121.5 for two ticks must trigger it.
             self.assertFalse(engine.observe_stop(quote("CALL", 120, 125), quote("PUT", 0, 0)))
             self.assertTrue(engine.observe_stop(quote("CALL", 120, 125), quote("PUT", 0, 0)))
+
+
+class ActiveOrderScopeTests(unittest.TestCase):
+    """The entry guard must block on leftover state for the traded asset only.
+
+    On 2026-08-06 an account-wide check aborted a BTC session because of a
+    reduce-only protective stop on P-XAUT-4200-070826, while the BTC book was
+    completely flat.
+    """
+
+    def client_with(self, symbols):
+        class Client(DeltaRESTClient):
+            def __init__(self, syms):
+                self._syms = syms
+
+            def active_orders(self):
+                return [{"product_symbol": s, "state": "pending"} for s in self._syms]
+
+        return Client(symbols)
+
+    def test_unrelated_asset_does_not_block(self):
+        client = self.client_with(["P-XAUT-4200-070826", "C-ETH-1800-110726"])
+        self.assertEqual(client.active_orders_for("BTC"), [])
+
+    def test_same_asset_option_blocks(self):
+        client = self.client_with(["P-XAUT-4200-070826", "C-BTC-64600-060826"])
+        blocking = client.active_orders_for("BTC")
+        self.assertEqual([o["product_symbol"] for o in blocking], ["C-BTC-64600-060826"])
+
+    def test_same_asset_perpetual_blocks(self):
+        """A BTC perp carries delta on the same underlying and is leftover state,
+        even though it does not use the hyphenated option symbol format."""
+        client = self.client_with(["BTCUSD"])
+        self.assertEqual(len(client.active_orders_for("BTC")), 1)
+
+    def test_empty_book_does_not_block(self):
+        self.assertEqual(self.client_with([]).active_orders_for("BTC"), [])
+
+    def test_missing_or_null_symbol_is_ignored(self):
+        class Client(DeltaRESTClient):
+            def __init__(self):
+                pass
+
+            def active_orders(self):
+                return [{"product_symbol": None}, {}, {"product_symbol": "C-BTC-64600-060826"}]
+
+        self.assertEqual(len(Client().active_orders_for("BTC")), 1)
 
 
 if __name__ == "__main__":

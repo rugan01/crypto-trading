@@ -106,6 +106,23 @@ class DeltaRESTClient:
     def active_orders(self) -> list[dict[str, Any]]:
         return self.request("GET", "/v2/orders", {"state": "open"}, auth=True)
 
+    def active_orders_for(self, asset: str) -> list[dict[str, Any]]:
+        """Open orders on `asset` only.
+
+        The entry guards must block on leftover state for the instrument being
+        traded, not on unrelated positions elsewhere in the account. On
+        2026-08-06 a reduce-only protective stop on P-XAUT-4200-070826 aborted
+        a BTC session whose own book was completely flat.
+
+        Matches the asset anywhere in the product symbol, so it covers options
+        (C-BTC-64600-060826) and perpetuals (BTCUSD) alike - a BTC perp carries
+        delta on the same underlying and is genuine leftover state, even though
+        it does not follow the hyphenated option format.
+        """
+        needle = asset.upper()
+        return [o for o in self.active_orders()
+                if needle in str(o.get("product_symbol") or "").upper()]
+
     def place_order(self, order: dict[str, Any]) -> dict[str, Any]:
         self.settings.assert_order_mode(allow_production=os.getenv("DELTA_PRODUCTION_ORDER_MODE") == "1")
         return self.request("POST", "/v2/orders", payload=order, auth=True)
