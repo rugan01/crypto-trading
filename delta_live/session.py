@@ -357,6 +357,9 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
         return 2
     engine.live_call = call_size > 0
     engine.live_put = put_size > 0
+    # Captured so a stop-out can be attributed to the underlying move.
+    engine.entry_spot = spot
+    engine.strike = Decimal(str(call_row.get("strike_price") or 0))
     position_size = max(call_size, put_size)
     if not (engine.live_call and engine.live_put):
         engine.event("single_leg_session", live_leg="call" if engine.live_call else "put",

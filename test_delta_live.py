@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime
@@ -407,6 +408,62 @@ class ActiveOrderScopeTests(unittest.TestCase):
                 return [{"product_symbol": None}, {}, {"product_symbol": "C-BTC-64600-060826"}]
 
         self.assertEqual(len(Client().active_orders_for("BTC")), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class UnderlyingMoveTests(unittest.TestCase):
+    """Stop-outs must be attributable to the underlying move, not inferred.
+
+    Before this, the log recorded only that premium expanded - so a stop could
+    not be told apart from a vol or spread move without guessing.
+    """
+
+    def engine(self, directory, entry_spot, strike, credit):
+        settings = Settings("testnet", True, None, None, None, None, TESTNET_REST,
+                            TESTNET_PUBLIC_WS, Path(directory), False)
+        eng = ExecutionEngine(settings, StrategyConfig(size=100, persistence_ticks=2),
+                              clock=lambda: datetime(2026, 8, 5, 17, 0))
+        eng.entry_spot = Decimal(str(entry_spot))
+        eng.strike = Decimal(str(strike))
+        eng.entry_credit = Decimal(str(credit))
+        eng.state = State.OPEN
+        return eng
+
+    def test_spot_derived_from_parity_and_move_measured(self):
+        with tempfile.TemporaryDirectory() as d:
+            eng = self.engine(d, 64075.6, 64000, 80)
+            # marks imply spot = 64000 + 140 - 2 = 64138
+            out = eng.underlying_move(quote("C", 139, 141, mark=140),
+                                      quote("P", 1.5, 2.5, mark=2))
+            self.assertEqual(out["spot_at_trigger"], Decimal("64138"))
+            self.assertEqual(out["spot_move_from_entry"],
+                             Decimal("64138") - Decimal("64075.6"))
+            self.assertEqual(out["stop_headroom_points"], Decimal("120") - Decimal("80"))
+            self.assertEqual(out["spot_source"], "put_call_parity_on_marks")
+
+    def test_single_leg_reports_unavailable_rather_than_wrong(self):
+        """Parity needs both legs; a single-leg session must not fabricate spot."""
+        with tempfile.TemporaryDirectory() as d:
+            eng = self.engine(d, 64075.6, 64000, 80)
+            eng.live_put = False
+            out = eng.underlying_move(quote("C", 139, 141, mark=140), quote("P", 0, 0, mark=0))
+            self.assertIsNone(out["spot_at_trigger"])
+            self.assertEqual(out["spot_source"], "unavailable_single_leg_or_no_strike")
+
+    def test_stop_triggered_event_carries_the_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            eng = self.engine(d, 64075.6, 64000, 80)
+            c, p = quote("C", 139, 141, mark=140), quote("P", 1.5, 2.5, mark=2)
+            self.assertFalse(eng.observe_stop(c, p))
+            self.assertTrue(eng.observe_stop(c, p))
+            rows = [json.loads(l) for l in eng.log_path.read_text().splitlines() if l.strip()]
+            trig = [r for r in rows if r["event"] == "stop_triggered"][0]
+            self.assertIn("spot_at_trigger", trig)
+            self.assertIn("spot_move_from_entry", trig)
+            self.assertIn("spot_move_pct", trig)
 
 
 if __name__ == "__main__":

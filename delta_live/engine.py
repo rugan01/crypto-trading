@@ -57,6 +57,10 @@ class ExecutionEngine:
         # than flattened, so the risk loop must know what it is protecting.
         self.live_call = True
         self.live_put = True
+        # Set by run_session so a stop-out can be attributed to the underlying
+        # move rather than inferred from option repricing after the fact.
+        self.entry_spot: Decimal | None = None
+        self.strike: Decimal | None = None
         settings.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = settings.log_dir / f"events-{self.clock():%Y%m%d}.jsonl"
 
@@ -145,9 +149,39 @@ class ExecutionEngine:
         if self.stop_hits >= self.strategy.persistence_ticks:
             self.state = State.EXITING
             self.event("stop_triggered", executable_buyback=executable_buyback,
-                       stop_level=self.stop_level)
+                       stop_level=self.stop_level,
+                       **self.underlying_move(call, put))
             return True
         return False
+
+    def underlying_move(self, call: Quote, put: Quote) -> dict[str, object]:
+        """Spot at this moment and how far it has travelled since entry.
+
+        Derived from put-call parity on the marks already in hand
+        (spot ~ strike + call_mark - put_mark) rather than a REST call, so it
+        costs nothing inside the risk loop.
+
+        This exists to separate two explanations for a stop-out that the log
+        could not previously distinguish: the underlying genuinely moved, versus
+        premium expanded on vol or spread. Without it the 5 August loss could
+        only be attributed to "the call repriced 75 -> 133", with the size of
+        the actual BTC move inferred rather than measured.
+        """
+        if self.strike is None or not (self.live_call and self.live_put):
+            return {"spot_at_trigger": None, "spot_move_from_entry": None,
+                    "spot_source": "unavailable_single_leg_or_no_strike"}
+        implied = self.strike + call.mark - put.mark
+        move = (implied - self.entry_spot) if self.entry_spot is not None else None
+        out: dict[str, object] = {
+            "spot_at_trigger": implied,
+            "entry_spot": self.entry_spot,
+            "spot_move_from_entry": move,
+            "spot_source": "put_call_parity_on_marks",
+        }
+        if move is not None and self.entry_spot:
+            out["spot_move_pct"] = move / self.entry_spot * 100
+            out["stop_headroom_points"] = self.stop_level - self.entry_credit
+        return out
 
     def halt(self, reason: str) -> None:
         self.state = State.HALTED
