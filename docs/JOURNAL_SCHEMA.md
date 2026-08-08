@@ -99,9 +99,10 @@ Private files under `outputs/` are gitignored because they can contain account-s
 
 ## Current production rule
 
-- BTC, 150 contracts per leg, common ATM 0DTE call and put, entered as one concurrent matched pair.
-  Reduced to 100 on 2026-08-06 when available balance fell to $83.00; restored to 150 on
-  2026-08-08 after it recovered to $106.43.
+- BTC, **125** contracts per leg, common ATM 0DTE call and put, entered as one concurrent matched
+  pair. **Target size is 150**, held at 125 until the account is funded to support it.
+  Size history: 150 -> 100 on 2026-08-06 when available balance fell to $83.00 -> 125 on
+  2026-08-08 at $106.43, which covers 125 but not 150.
 - **Sizing check.** The binding constraint is base margin PLUS premium margin, not base alone:
   `base = spot * 0.001 * size / 200 * 2` and `premium = combined_credit * 0.001 * size`. Both must
   fit inside available balance or the exchange rejects the order. Premium margin scales with the

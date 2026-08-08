@@ -5,19 +5,24 @@ cd /Users/rugan/Projects/Delta
 mkdir -p outputs/live
 exec >> outputs/live/production-scheduler-$(date +%Y%m%d).log 2>&1
 
-# Restored to 150 on 2026-08-08 at Bala's instruction, after the account
-# recovered from $83.00 (6 Aug) to $106.43.
+# TARGET IS 150. Running 125 until the account is funded to support it.
 #
-# Sizing check before raising further, or if a run fails on margin. The binding
-# constraint is base margin PLUS premium margin, not base alone:
+# The binding constraint is base margin PLUS premium margin, not base alone:
 #   base    = spot * 0.001 * size / 200 * 2
 #   premium = combined_credit * 0.001 * size
 # Both must fit inside available balance or the exchange rejects the order.
-# Premium margin scales with the day's credit, so a high-premium session needs
-# more margin at the same size - on 8 Aug a 96 credit put the 150-lot
-# requirement at $111.89 against $106.43 available.
-BTC_SIZE="${DELTA_BTC_SIZE:-150}"
-BTC_SLICE_SIZE="${DELTA_BTC_SLICE_SIZE:-150}"
+# Premium margin scales with the day's credit, so the same size needs more
+# margin on a high-premium session.
+#
+# 2026-08-08 at spot 64,996 and a 96 credit:
+#   150 -> base $97.49 + premium $14.40 = $111.89  vs $106.43 available  FAILS
+#   125 -> base $81.25 + premium $12.00 =  $93.25  vs $106.43 available  OK
+#
+# Raise to 150 once available balance clears roughly $120 on a normal-credit
+# day. Re-run the arithmetic above first - do not assume, since a high-credit
+# session can push the requirement well past base margin alone.
+BTC_SIZE="${DELTA_BTC_SIZE:-125}"
+BTC_SLICE_SIZE="${DELTA_BTC_SLICE_SIZE:-125}"
 PERMISSIVE_ENTRY="${DELTA_PERMISSIVE_ENTRY:-true}"
 
 echo "scheduler_started $(date '+%Y-%m-%dT%H:%M:%S%z')"
