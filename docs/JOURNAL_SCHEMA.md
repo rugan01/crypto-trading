@@ -99,16 +99,33 @@ Private files under `outputs/` are gitignored because they can contain account-s
 
 ## Current production rule
 
-- BTC, **125** contracts per leg, common ATM 0DTE call and put, entered as one concurrent matched
-  pair. **Target size is 150**, held at 125 until the account is funded to support it.
-  Size history: 150 -> 100 on 2026-08-06 when available balance fell to $83.00 -> 125 on
-  2026-08-08 at $106.43, which covers 125 but not 150.
-- **Sizing check.** The binding constraint is base margin PLUS premium margin, not base alone:
-  `base = spot * 0.001 * size / 200 * 2` and `premium = combined_credit * 0.001 * size`. Both must
-  fit inside available balance or the exchange rejects the order. Premium margin scales with the
-  day's credit, so a high-premium session needs more margin at the same size. This is distinct
-  from the `projected_free` telemetry warning, which was reviewed on 2026-08-01 and accepted as
-  not applicable to a 20-minute defined-stop book - that one is advisory, this one is hard.
+- BTC, **target 150** contracts per leg, common ATM 0DTE call and put, entered as one concurrent
+  matched pair. **Size is chosen automatically each session** - see below - so 150 is a ceiling,
+  not a fixed quantity.
+- **Auto-sizing (effective 2026-08-08).** `delta_live.size_check` computes the largest size the
+  account can margin and clamps the target down to it. It can only reduce, never raise above the
+  target, so the worst case is a smaller position rather than a rejected or partially filled entry.
+
+      base_per_contract    = spot * 0.001 / 200 * 2
+      premium_per_contract = combined_credit * 0.001
+      budget               = (available - 5 fee buffer) * 0.95 safety
+      size                 = min(target, floor(budget / per_contract) rounded down to 25)
+
+  Returns 0 - a hard NO TRADE with a Telegram alert - when it cannot afford the 50-contract
+  minimum, rather than opening a token position that cannot cover its own commission.
+
+  The reason this exists: sizing failed three times in three days because the requirement was
+  checked against base margin alone. The exchange needs base PLUS premium, and premium scales with
+  the day's credit, so the same size fits one day and is rejected the next on an identical balance.
+  On 2026-08-08 base alone was $97.49 against $106.43 available and looked fine; adding $14.40 of
+  premium margin took the real requirement to $111.89.
+
+  Distinct from the `projected_free` telemetry warning, which was reviewed on 2026-08-01 and
+  accepted as not applicable to a 20-minute defined-stop book. That one is advisory; this is hard.
+
+  Verified against every sizing decision actually taken: 6 Aug ($83.00, credit 52) -> 100,
+  8 Aug ($106.43, credit 96) -> 125, and 5 Aug ($114.52, credit 83.1) -> 125 where the session
+  in fact ran 150 and printed `projected_free` of -2.20.
 - Entry decision at 17:00 IST; mandatory exit begins 17:24:30 and completes by 17:25.
 - Both products must report exactly 200x leverage.
 - Combined executable stop is 1.5 times actual combined fill, persisted twice.

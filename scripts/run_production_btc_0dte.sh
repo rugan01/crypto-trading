@@ -5,27 +5,40 @@ cd /Users/rugan/Projects/Delta
 mkdir -p outputs/live
 exec >> outputs/live/production-scheduler-$(date +%Y%m%d).log 2>&1
 
-# TARGET IS 150. Running 125 until the account is funded to support it.
-#
-# The binding constraint is base margin PLUS premium margin, not base alone:
-#   base    = spot * 0.001 * size / 200 * 2
-#   premium = combined_credit * 0.001 * size
-# Both must fit inside available balance or the exchange rejects the order.
-# Premium margin scales with the day's credit, so the same size needs more
-# margin on a high-premium session.
-#
-# 2026-08-08 at spot 64,996 and a 96 credit:
-#   150 -> base $97.49 + premium $14.40 = $111.89  vs $106.43 available  FAILS
-#   125 -> base $81.25 + premium $12.00 =  $93.25  vs $106.43 available  OK
-#
-# Raise to 150 once available balance clears roughly $120 on a normal-credit
-# day. Re-run the arithmetic above first - do not assume, since a high-credit
-# session can push the requirement well past base margin alone.
-BTC_SIZE="${DELTA_BTC_SIZE:-125}"
-BTC_SLICE_SIZE="${DELTA_BTC_SLICE_SIZE:-125}"
+# TARGET size per leg. Auto-sizing clamps this down to whatever margin actually
+# supports on the day, so this is a ceiling rather than a fixed quantity.
+BTC_TARGET_SIZE="${DELTA_BTC_SIZE:-150}"
 PERMISSIVE_ENTRY="${DELTA_PERMISSIVE_ENTRY:-true}"
 
 echo "scheduler_started $(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+# Auto-size. The exchange needs base PLUS premium margin inside available
+# balance, and premium margin scales with the day's credit, so a fixed size can
+# fit one day and be rejected the next on an identical balance. This only ever
+# reduces below the target, never raises above it.
+set +e
+# Only stdout is captured; the size_check diagnostics go to stderr, which the
+# exec at the top of this script already routes into the scheduler log.
+BTC_SIZE=$(DELTA_ENV=production /Users/rugan/Projects/Delta/.venv/bin/python \
+  -m delta_live.size_check --asset BTC --target "$BTC_TARGET_SIZE")
+size_status=$?
+set -e
+if [ "$size_status" -ne 0 ] || [ -z "$BTC_SIZE" ]; then
+  echo "size_check_failed status=$size_status - falling back to target $BTC_TARGET_SIZE"
+  BTC_SIZE="$BTC_TARGET_SIZE"
+fi
+if [ "$BTC_SIZE" -eq 0 ]; then
+  echo "NO TRADE: margin supports less than the minimum viable size"
+  DELTA_ENV=production /Users/rugan/Projects/Delta/.venv/bin/python \
+    -m delta_live.cli telegram-notify \
+    --message "Delta BTC 0DTE: NO TRADE today. Available margin supports less than the minimum viable size against a target of ${BTC_TARGET_SIZE} contracts per leg." || true
+  exit 0
+fi
+if [ "$BTC_SIZE" -ne "$BTC_TARGET_SIZE" ]; then
+  echo "auto_sized target=$BTC_TARGET_SIZE chosen=$BTC_SIZE"
+fi
+BTC_SLICE_SIZE="${DELTA_BTC_SLICE_SIZE:-$BTC_SIZE}"
+
 if ! DELTA_ENV=production /Users/rugan/Projects/Delta/.venv/bin/python \
   -m delta_live.cli telegram-notify \
   --message "Delta BTC 0DTE production scheduler started at 16:55 IST; target is ${BTC_SIZE} contracts per leg in one matched submission, paired entry is scheduled for 17:00 IST, and market-quality checks are telemetry-only."; then

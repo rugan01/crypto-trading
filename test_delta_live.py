@@ -12,6 +12,7 @@ from delta_live.engine import ExecutionEngine, State, StrategyConfig
 from delta_live.liquidity import Quote, entry_gate, tick_price
 from delta_live.manage_open import open_short_straddle
 from delta_live.session import close_positions, depth_aware_exit_limit, enter_paired_slices
+from delta_live.size_check import feasible_size
 
 
 def quote(symbol, bid, ask, size=200, mark=None):
@@ -410,6 +411,54 @@ class ActiveOrderScopeTests(unittest.TestCase):
         self.assertEqual(len(Client().active_orders_for("BTC")), 1)
 
 
+class AutoSizeTests(unittest.TestCase):
+    """Auto-sizing must reproduce the sizing decisions actually taken this week.
+
+    Sizing failed three times in three days because only base margin was
+    checked. The requirement is base PLUS premium, and premium scales with the
+    day's credit, so the same size fits one day and is rejected the next on an
+    identical balance.
+    """
+
+    def test_reproduces_8_august_decision_125(self):
+        # available $106.43, spot 64,996.5, credit 96 -> 150 needs $111.89, fails
+        size = feasible_size(Decimal("106.43"), Decimal("64996.5"), Decimal("96"), target=150)
+        self.assertEqual(size, 125)
+
+    def test_reproduces_6_august_decision_100(self):
+        # available $83.00, spot 64,584.7, credit 52
+        size = feasible_size(Decimal("83.00"), Decimal("64584.7"), Decimal("52"), target=150)
+        self.assertEqual(size, 100)
+
+    def test_would_have_reduced_5_august_from_150(self):
+        """5 Aug ran 150 and printed projected_free -2.20 at preflight."""
+        size = feasible_size(Decimal("114.518"), Decimal("64075.6"), Decimal("83.1"), target=150)
+        self.assertEqual(size, 125)
+
+    def test_never_exceeds_target_even_when_rich(self):
+        size = feasible_size(Decimal("100000"), Decimal("64000"), Decimal("50"), target=150)
+        self.assertEqual(size, 150)
+
+    def test_high_credit_reduces_size_at_same_balance(self):
+        """The failure mode that base-margin-only checking misses."""
+        cheap = feasible_size(Decimal("106.43"), Decimal("64996.5"), Decimal("40"), target=150)
+        rich = feasible_size(Decimal("106.43"), Decimal("64996.5"), Decimal("150"), target=150)
+        self.assertGreater(cheap, rich)
+
+    def test_returns_zero_rather_than_a_token_position(self):
+        self.assertEqual(feasible_size(Decimal("20"), Decimal("64000"), Decimal("50"), target=150), 0)
+
+    def test_zero_budget_and_bad_inputs_are_safe(self):
+        self.assertEqual(feasible_size(Decimal("5"), Decimal("64000"), Decimal("50"), target=150), 0)
+        self.assertEqual(feasible_size(Decimal("500"), Decimal("0"), Decimal("50"), target=150), 0)
+        self.assertEqual(feasible_size(Decimal("500"), Decimal("64000"), Decimal("50"), target=0), 0)
+
+    def test_result_is_always_on_the_increment(self):
+        for avail in ("83", "95", "106.43", "118", "131"):
+            size = feasible_size(Decimal(avail), Decimal("64996.5"), Decimal("96"), target=150)
+            self.assertEqual(size % 25, 0, f"available {avail} gave {size}")
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -464,6 +513,54 @@ class UnderlyingMoveTests(unittest.TestCase):
             self.assertIn("spot_at_trigger", trig)
             self.assertIn("spot_move_from_entry", trig)
             self.assertIn("spot_move_pct", trig)
+
+
+class AutoSizeTests(unittest.TestCase):
+    """Auto-sizing must reproduce the sizing decisions actually taken this week.
+
+    Sizing failed three times in three days because only base margin was
+    checked. The requirement is base PLUS premium, and premium scales with the
+    day's credit, so the same size fits one day and is rejected the next on an
+    identical balance.
+    """
+
+    def test_reproduces_8_august_decision_125(self):
+        # available $106.43, spot 64,996.5, credit 96 -> 150 needs $111.89, fails
+        size = feasible_size(Decimal("106.43"), Decimal("64996.5"), Decimal("96"), target=150)
+        self.assertEqual(size, 125)
+
+    def test_reproduces_6_august_decision_100(self):
+        # available $83.00, spot 64,584.7, credit 52
+        size = feasible_size(Decimal("83.00"), Decimal("64584.7"), Decimal("52"), target=150)
+        self.assertEqual(size, 100)
+
+    def test_would_have_reduced_5_august_from_150(self):
+        """5 Aug ran 150 and printed projected_free -2.20 at preflight."""
+        size = feasible_size(Decimal("114.518"), Decimal("64075.6"), Decimal("83.1"), target=150)
+        self.assertEqual(size, 125)
+
+    def test_never_exceeds_target_even_when_rich(self):
+        size = feasible_size(Decimal("100000"), Decimal("64000"), Decimal("50"), target=150)
+        self.assertEqual(size, 150)
+
+    def test_high_credit_reduces_size_at_same_balance(self):
+        """The failure mode that base-margin-only checking misses."""
+        cheap = feasible_size(Decimal("106.43"), Decimal("64996.5"), Decimal("40"), target=150)
+        rich = feasible_size(Decimal("106.43"), Decimal("64996.5"), Decimal("150"), target=150)
+        self.assertGreater(cheap, rich)
+
+    def test_returns_zero_rather_than_a_token_position(self):
+        self.assertEqual(feasible_size(Decimal("20"), Decimal("64000"), Decimal("50"), target=150), 0)
+
+    def test_zero_budget_and_bad_inputs_are_safe(self):
+        self.assertEqual(feasible_size(Decimal("5"), Decimal("64000"), Decimal("50"), target=150), 0)
+        self.assertEqual(feasible_size(Decimal("500"), Decimal("0"), Decimal("50"), target=150), 0)
+        self.assertEqual(feasible_size(Decimal("500"), Decimal("64000"), Decimal("50"), target=0), 0)
+
+    def test_result_is_always_on_the_increment(self):
+        for avail in ("83", "95", "106.43", "118", "131"):
+            size = feasible_size(Decimal(avail), Decimal("64996.5"), Decimal("96"), target=150)
+            self.assertEqual(size % 25, 0, f"available {avail} gave {size}")
 
 
 if __name__ == "__main__":
