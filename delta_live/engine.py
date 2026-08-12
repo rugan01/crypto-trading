@@ -61,15 +61,40 @@ class ExecutionEngine:
         # move rather than inferred from option repricing after the fact.
         self.entry_spot: Decimal | None = None
         self.strike: Decimal | None = None
+        # Filled quantity and notional per symbol on the way out, accumulated by
+        # close_positions so the session can report realised P&L without having
+        # to re-derive it from the event log.
+        self.exit_fills: dict[str, dict[str, Decimal]] = {}
+        # Every order id this engine placed. Commission must be attributed to
+        # the session's own fills: manual trades on the same contract are common
+        # (12 August had 125 manually sold puts on the session's own symbol) and
+        # a symbol-level sum would silently absorb their fees.
+        self.order_ids: set[int] = set()
         settings.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = settings.log_dir / f"events-{self.clock():%Y%m%d}.jsonl"
+
+    def notify(self, text: str) -> None:
+        """Fire-and-forget Telegram send. Never blocks or raises on the caller."""
+        threading.Thread(target=self.notifier.send, args=(text,),
+                         name="telegram-notify", daemon=False).start()
+
+    def record_exit_fill(self, symbol: str, size: int, price: Decimal) -> None:
+        row = self.exit_fills.setdefault(symbol, {"size": Decimal(0), "notional": Decimal(0)})
+        row["size"] += Decimal(size)
+        row["notional"] += Decimal(price) * Decimal(size)
+
+    def record_order_id(self, order_id: object) -> None:
+        try:
+            self.order_ids.add(int(order_id))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            pass
 
     def event(self, name: str, **fields: object) -> None:
         row = {"time": self.clock().isoformat(), "state": self.state.value, "event": name, **fields}
         with self.log_path.open("a") as handle:
             handle.write(json.dumps(row, default=str, sort_keys=True) + "\n")
         if name in {"ready", "no_trade", "adopted_position", "entry_filled", "stop_armed",
-                    "stop_triggered", "closed", "halted"}:
+                    "stop_triggered", "closed", "halted", "fee_coverage_warning"}:
             message = (f"Delta {self.settings.environment.upper()} | {name}\n" +
                        "\n".join(f"{k}: {v}" for k, v in fields.items()))
             # A slow Telegram API must never delay stop arming or risk ticks.

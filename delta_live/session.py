@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -54,6 +54,76 @@ def filled(order: dict) -> tuple[int, Decimal]:
     remaining = int(order.get("unfilled_size") or 0)
     price = Decimal(str(order.get("average_fill_price") or 0))
     return size - remaining, price
+
+
+# An order must never be priced from a quote older than this. Set from a
+# 30-sample probe of both sources on 2026-08-12 (BTC ATM option, 0.4s apart):
+#
+#   L2 book   p50 0.61s   p90 2.00s   max 2.28s    0/30 over 3s
+#   /v2/tickers p50 4.21s p90 6.61s   max 8.19s   22/30 over 3s
+#
+# 3s therefore rejects effectively none of the healthy source and most of the
+# stale one. A 2s ceiling was tried first and refused 10% of good L2 reads,
+# which just burns retry attempts without avoiding any bad fill.
+MAX_PRICING_QUOTE_AGE_S = Decimal("3.0")
+
+# Retry ladder, anchored on the live bid rather than the entry-time bid. The
+# cushion only absorbs read-to-fill latency, so it starts tight and widens
+# slowly; a sell priced just under a real bid crosses and fills at the bid.
+RETRY_CUSHION_START = Decimal("0.995")
+RETRY_CUSHION_STEP = Decimal("0.005")
+RETRY_CUSHION_FLOOR = Decimal("0.97")
+# Circuit breaker, not the primary control: if the live bid has fallen this far
+# below the entry-time bid, stop chasing and let the retain rule decide. The
+# minimum_combined_credit gate remains the designed control for credit quality.
+MAX_CHASE_OF_ENTRY_BID = Decimal("0.75")
+
+# Delta's options commission, measured over all 262 BTC option fills in the
+# book: a flat 4.130% of premium traded, identical on buys and sells, with NO
+# fixed floor - a $0.0008 premium pays $0.000033, the same rate. Large premiums
+# are sometimes charged less where a notional cap binds, so 4.130% is the
+# worst case and the right number to plan against.
+FEE_RATE = Decimal("0.0413")
+
+# Round-tripping a straddle pays the fee twice, on the credit in and the debit
+# out. Breakeven is buying back at (1-r)/(1+r) = 92.07% of the credit, so the
+# structure must give back 7.93% of its entry credit just to cover fees.
+#
+# Note this is a RATIO, not a dollar amount: because the fee is perfectly
+# proportional to premium, a 30-point credit is no more fee-burdened than a
+# 300-point one. There is therefore no absolute minimum credit to derive here.
+# What actually has to pay the 7.93% is EXTRINSIC value - intrinsic does not
+# decay, and selling it is a directional bet, not a theta trade.
+FEE_HURDLE_PCT_OF_CREDIT = (Decimal(1) - (Decimal(1) - FEE_RATE) / (Decimal(1) + FEE_RATE))
+
+# Advisory only. Warn when extrinsic covers the fee hurdle by less than this
+# multiple, i.e. when the decay edge is thin relative to what the round trip
+# costs. Set to fire on roughly a third of sessions so three occurrences
+# accumulate in about a week; NOTHING is gated on it until that sample exists.
+MIN_FEE_COVERAGE_WARN = Decimal("1.5")
+
+
+def pricing_quote(engine: ExecutionEngine, symbol: str) -> tuple[Quote, str]:
+    """Freshest available quote for pricing an order, with its source.
+
+    Prefers /v2/l2orderbook (median 0.61s stale) over /v2/tickers (5.5s
+    refresh, median 4.21s stale on read). On 2026-08-12 the ticker reported
+    the put bid pinned at exactly 28.00 for the entire 8.5-second retry window
+    while the executable bid fell to 22, so every IOC retry was priced above
+    the book and cancelled unfilled. Callers must still check `age_seconds`:
+    this returns the best quote available, not necessarily a usable one.
+    """
+    try:
+        book = engine.client.l2_orderbook(symbol, depth=5)
+    except Exception as exc:
+        engine.event("pricing_quote_l2_failed", symbol=symbol,
+                     error_type=type(exc).__name__, fallback="ticker")
+    else:
+        quote = Quote.from_l2(symbol, book)
+        if quote.bid > 0:
+            return quote, "l2"
+        engine.event("pricing_quote_l2_empty", symbol=symbol, fallback="ticker")
+    return Quote.from_ticker(engine.client.ticker(symbol)), "ticker"
 
 
 def depth_aware_exit_limit(product: dict, quote: Quote, orderbook: dict,
@@ -133,8 +203,19 @@ def enter_paired_slices(engine: ExecutionEngine, call_product: dict, put_product
     while matched < requested_size and time.monotonic() < deadline:
         target = min(slice_size, requested_size - matched)
         slice_index += 1
-        call_quote = Quote.from_ticker(engine.client.ticker(call_symbol))
-        put_quote = Quote.from_ticker(engine.client.ticker(put_symbol))
+        call_quote, call_source = pricing_quote(engine, call_symbol)
+        put_quote, put_source = pricing_quote(engine, put_symbol)
+        now_us = time.time() * 1_000_000
+        # Logged, not gated. The retry ladder below refuses to price off a stale
+        # quote because it has the retain rule to fall back on; blocking the
+        # first slice the same way would risk burning the entry window whenever
+        # L2 is unavailable and only the cached ticker is left.
+        engine.event("entry_slice_quotes", slice=slice_index,
+                     call_source=call_source, put_source=put_source,
+                     call_bid=call_quote.bid, put_bid=put_quote.bid,
+                     call_bid_size=call_quote.bid_size, put_bid_size=put_quote.bid_size,
+                     call_age_s=call_quote.age_seconds(now_us),
+                     put_age_s=put_quote.age_seconds(now_us))
         # Permissive production mode prioritizes completing the frozen daily
         # sample while retaining bounded IOC orders rather than market orders.
         entry_factor = Decimal("0.90") if engine.settings.permissive_entry else Decimal("0.98")
@@ -155,37 +236,64 @@ def enter_paired_slices(engine: ExecutionEngine, call_product: dict, put_product
             call_order, put_order = call_future.result(), put_future.result()
         call_filled, call_price = filled(call_order)
         put_filled, put_price = filled(put_order)
+        engine.record_order_id(call_order.get("id"))
+        engine.record_order_id(put_order.get("id"))
         engine.event("entry_slice", slice=slice_index, target=target,
                      call_order=call_order.get("id"), put_order=put_order.get("id"),
                      call_filled=call_filled, put_filled=put_filled)
 
         grace_deadline = min(deadline, time.monotonic() + unmatched_grace)
         attempt = 0
+        placed = 0
         while call_filled != put_filled and time.monotonic() < grace_deadline:
             attempt += 1
             if call_filled < put_filled:
-                quote = Quote.from_ticker(engine.client.ticker(call_symbol))
-                limit = quote.bid * max(Decimal("0.90"), Decimal("0.98") - Decimal("0.01") * attempt)
-                other_price = put_price
-                product, side_name = call_product, "call"
+                symbol, product, side_name = call_symbol, call_product, "call"
+                other_price, entry_bid = put_price, initial_call.bid
                 need = put_filled - call_filled
                 suffix = f"ce{slice_index}r{attempt}"
             else:
-                quote = Quote.from_ticker(engine.client.ticker(put_symbol))
-                limit = quote.bid * max(Decimal("0.90"), Decimal("0.98") - Decimal("0.01") * attempt)
-                other_price = call_price
-                product, side_name = put_product, "put"
+                symbol, product, side_name = put_symbol, put_product, "put"
+                other_price, entry_bid = call_price, initial_put.bid
                 need = call_filled - put_filled
                 suffix = f"pe{slice_index}r{attempt}"
+            quote, source = pricing_quote(engine, symbol)
+            age = quote.age_seconds(time.time() * 1_000_000)
+            if quote.bid <= 0 or age > MAX_PRICING_QUOTE_AGE_S:
+                # Refusing to trade beats pricing off a snapshot of a book that
+                # has moved. This is the 2026-08-12 failure: six IOC sells were
+                # priced from one frozen quote and every one cancelled unfilled.
+                engine.event("entry_retry_stale_quote", slice=slice_index, attempt=attempt,
+                             missing_leg=side_name, quote_source=source, quote_age_s=age,
+                             max_age_s=MAX_PRICING_QUOTE_AGE_S, bid=quote.bid)
+                time.sleep(0.3)
+                continue
+            # Chase the LIVE bid. The cushion only has to absorb the latency
+            # between reading the book and the order landing, so it is small and
+            # widens slowly - the old ladder stepped down from the ENTRY bid to
+            # a floor of 0.90x, which on 12 August put its most aggressive
+            # possible price 13% above the market and made a fill arithmetically
+            # impossible however many times it retried.
+            cushion = max(RETRY_CUSHION_FLOOR, RETRY_CUSHION_START - RETRY_CUSHION_STEP * placed)
+            limit = quote.bid * cushion
+            if entry_bid > 0 and limit < entry_bid * MAX_CHASE_OF_ENTRY_BID:
+                # The book has run away from the entry price. Stop chasing and
+                # let the retain rule take over rather than selling into a hole.
+                engine.event("entry_retry_chase_abandoned", slice=slice_index, attempt=attempt,
+                             missing_leg=side_name, candidate_limit=limit, live_bid=quote.bid,
+                             entry_bid=entry_bid, floor=entry_bid * MAX_CHASE_OF_ENTRY_BID)
+                break
             if other_price + limit < minimum_combined_credit:
                 engine.event("entry_retry_wait", reason="combined_credit_below_floor",
                              missing_leg=side_name, candidate_limit=limit,
                              minimum_combined_credit=minimum_combined_credit)
                 time.sleep(0.5)
                 continue
+            placed += 1
             retry = engine.client.place_order(engine.order_payload(
                 product, "sell", need, limit, suffix, False))
             got, price = filled(retry)
+            engine.record_order_id(retry.get("id"))
             if side_name == "call":
                 if got:
                     call_price = ((call_price * call_filled) + (price * got)) / (call_filled + got)
@@ -196,11 +304,14 @@ def enter_paired_slices(engine: ExecutionEngine, call_product: dict, put_product
                 put_filled += got
             # limit/bid are logged so an unfilled leg can be diagnosed after the
             # fact: without them there is no way to tell "priced too high" from
-            # "no resting bid" once the book has moved on.
+            # "no resting bid" once the book has moved on. quote_source and
+            # quote_age_s make a stale-quote failure visible from the log alone
+            # rather than needing a live probe to reconstruct it.
             engine.event("entry_leg_retry", slice=slice_index, attempt=attempt,
                          missing_leg=side_name, order=retry.get("id"), filled=got,
                          limit=limit, bid=quote.bid, ask=quote.ask,
                          bid_size=quote.bid_size, needed=need,
+                         quote_source=source, quote_age_s=age, cushion=cushion,
                          call_filled=call_filled, put_filled=put_filled)
             if call_filled != put_filled:
                 time.sleep(0.5)
@@ -232,6 +343,81 @@ def enter_paired_slices(engine: ExecutionEngine, call_product: dict, put_product
     call_avg = call_notional / call_live if call_live else Decimal(0)
     put_avg = put_notional / put_live if put_live else Decimal(0)
     return matched, call_avg, put_avg, call_live, put_live
+
+
+def usd(amount: Decimal) -> Decimal:
+    return Decimal(amount).quantize(Decimal("0.0001"))
+
+
+def summarise_pnl(engine: ExecutionEngine, contract_value: Decimal,
+                  entry_legs: list[tuple[str, Decimal, int]]) -> dict:
+    """Realised USD P&L for the session, net of Delta's own commission.
+
+    ``entry_legs`` is ``[(symbol, average_entry_price, size)]`` for the legs
+    actually held - which on a retained single-leg session is one leg, not two.
+
+    Commission comes from authenticated fills restricted to this engine's own
+    order ids, so a manual trade on the same contract cannot be absorbed into
+    the automated session's number. It is best-effort: a fees lookup failing
+    after the book is already flat must not fail the session, so the caller
+    reports gross and flags the gap instead.
+    """
+    entry_credit = sum((price * size for _, price, size in entry_legs), Decimal(0)) * contract_value
+    exit_debit = sum((row["notional"] for row in engine.exit_fills.values()),
+                     Decimal(0)) * contract_value
+    gross = entry_credit - exit_debit
+    commission: Decimal | None = None
+    try:
+        commission = sum((Decimal(str(f.get("commission") or 0))
+                          for f in engine.client.fills(page_size=200)
+                          if int(f.get("order_id") or 0) in engine.order_ids), Decimal(0))
+    except Exception as exc:
+        engine.event("pnl_commission_unavailable", error_type=type(exc).__name__, error=str(exc))
+    return {
+        "entry_credit_usd": usd(entry_credit),
+        "exit_debit_usd": usd(exit_debit),
+        "gross_usd": usd(gross),
+        "commission_usd": None if commission is None else usd(commission),
+        "net_usd": None if commission is None else usd(gross - commission),
+    }
+
+
+def pnl_message(engine: ExecutionEngine, reason: str, pnl: dict, closed: bool,
+                entry_legs: list[tuple[str, Decimal, int]]) -> str:
+    label = {"time_exit": "TIME EXIT",
+             "combined_50_stop": "STOP LOSS",
+             "combined_50_stop_rest_recovery": "STOP LOSS (REST recovery)"}.get(reason, reason.upper())
+
+    def money(amount: Decimal, places: str = "0.0001") -> str:
+        """Magnitude only. For credit, debit and commission the direction is in
+        the label, so a leading sign would just be noise."""
+        return f"${Decimal(amount).quantize(Decimal(places), rounding=ROUND_HALF_UP)}"
+
+    def signed(amount: Decimal, places: str = "0.0001") -> str:
+        """Sign outside the currency symbol, and half-up so the rounded
+        headline never disagrees with the exact figure below it."""
+        rounded = Decimal(amount).quantize(Decimal(places), rounding=ROUND_HALF_UP)
+        return f"{'-' if rounded < 0 else '+'}${abs(rounded)}"
+
+    net = pnl["net_usd"]
+    headline = "net unavailable" if net is None else f"NET {signed(net, '0.01')}"
+    lines = [f"Delta {engine.settings.environment.upper()} | {label} | {headline}",
+             f"Entry credit: {money(pnl['entry_credit_usd'])}",
+             f"Exit debit:   {money(pnl['exit_debit_usd'])}",
+             f"Gross:        {signed(pnl['gross_usd'])}"]
+    if pnl["commission_usd"] is None:
+        lines.append("Commission:   unavailable (fills lookup failed); gross only")
+    else:
+        lines.append(f"Commission:   {money(pnl['commission_usd'])}")
+        lines.append(f"Net:          {signed(net)}")
+    for symbol, price, size in entry_legs:
+        got = engine.exit_fills.get(symbol, {})
+        out = (got["notional"] / got["size"]) if got.get("size") else None
+        lines.append(f"{symbol}: {size} @ {price} -> "
+                     + (f"{usd(out)}" if out is not None else "not closed"))
+    if not closed:
+        lines.append("WARNING: exit incomplete, position may not be flat.")
+    return "\n".join(lines)
 
 
 def nearest_chain(client: DeltaRESTClient, asset: str) -> tuple[str, list[dict]]:
@@ -274,10 +460,10 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
         if leverage != Decimal("200"):
             raise RuntimeError(f"NO TRADE: {product['symbol']} leverage is {leverage}, not 200")
     call_quote, put_quote = engine.preflight(call_row, put_row)
+    contract_value = Decimal(str(call_product["contract_value"]))
     if settings.environment == "production":
-        usd = next(b for b in client.balances() if b.get("asset_symbol") == "USD")
-        available = Decimal(str(usd["available_balance"]))
-        contract_value = Decimal(str(call_product["contract_value"]))
+        wallet = next(b for b in client.balances() if b.get("asset_symbol") == "USD")
+        available = Decimal(str(wallet["available_balance"]))
         base_margin = spot * contract_value * size / Decimal("200") * 2
         premium_margin = (call_quote.bid + put_quote.bid) * contract_value * size
         projected_free = available - base_margin - premium_margin - Decimal("5")
@@ -327,6 +513,34 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
         )
     except Exception as exc:  # telemetry must never block a trade
         engine.event("market_context_failed", error_type=type(exc).__name__, error=str(exc))
+
+    # Can this structure pay its own round-trip commission out of decay?
+    #
+    # Recorded every session, gating nothing. Across 23 completed sessions the
+    # correlation between entry credit and net outcome is +0.06 (-0.05 once
+    # normalised by credit) - entry credit does NOT predict the result, and a
+    # floor at 50 points would have blocked four sessions worth +$4.02 of the
+    # book's +$12.09 lifetime net. So the warning is on fee COVERAGE, not on
+    # credit: extrinsic is the only part of the credit that decays, and it has
+    # to clear the 7.93% hurdle before any of the trade is edge rather than a
+    # directional bet. Three flagged sessions and this gets revisited on data.
+    try:
+        combined_bid = call_quote.bid + put_quote.bid
+        extrinsic = combined_bid - abs(spot - Decimal(str(call_row.get("strike_price") or 0)))
+        hurdle = combined_bid * FEE_HURDLE_PCT_OF_CREDIT
+        coverage = (extrinsic / hurdle) if hurdle > 0 else Decimal(0)
+        thin = coverage < MIN_FEE_COVERAGE_WARN
+        engine.event("fee_coverage_warning" if thin else "fee_coverage",
+                     combined_credit=combined_bid, fee_rate=FEE_RATE,
+                     hurdle_pct_of_credit=FEE_HURDLE_PCT_OF_CREDIT * 100,
+                     hurdle_points=hurdle, extrinsic_points=extrinsic,
+                     coverage_ratio=coverage, warn_below=MIN_FEE_COVERAGE_WARN,
+                     mode="telemetry_only",
+                     note="extrinsic is the only part of the credit that decays; "
+                          "below 1.0 the trade cannot cover commission from decay "
+                          "at all and any profit must come from a directional move")
+    except Exception as exc:
+        engine.event("fee_coverage_failed", error_type=type(exc).__name__, error=str(exc))
 
     # Advisory only. A leg quoted below the floor is very likely to be unfillable
     # in size and contributes almost nothing to the credit, but this must never
@@ -419,6 +633,18 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
         stream.close()
     engine.state = State.CLOSED if ok else State.HALTED
     engine.event("closed" if ok else "halted", reason=reason if ok else "exit_incomplete")
+    # Realised P&L on every exit, stop or time alike. Reported after the close
+    # so a slow fills lookup cannot delay risk reduction, and wrapped because a
+    # reporting failure must never change the session's exit status.
+    try:
+        entry_legs = [leg for leg in
+                      ((call_symbol, call_fill, call_size), (put_symbol, put_fill, put_size))
+                      if leg[2] > 0]
+        pnl = summarise_pnl(engine, contract_value, entry_legs)
+        engine.event("session_pnl", reason=reason, exit_complete=ok, **pnl)
+        engine.notify(pnl_message(engine, reason, pnl, ok, entry_legs))
+    except Exception as exc:
+        engine.event("session_pnl_failed", error_type=type(exc).__name__, error=str(exc))
     return 0 if ok else 3
 
 
@@ -489,6 +715,9 @@ def close_positions(engine: ExecutionEngine, legs: list[tuple[dict, str, int]],
                     continue
                 got, price = filled(order)
                 row["remaining"] = max(0, row["remaining"] - got)
+                engine.record_order_id(order.get("id"))
+                if got:
+                    engine.record_exit_fill(symbol, got, price)
                 engine.event("exit_order", symbol=symbol, order=order.get("id"), filled=got,
                              fill_price=price, remaining=row["remaining"],
                              limit_price=payload["limit_price"], attempt=attempt + 1)
