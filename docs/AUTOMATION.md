@@ -21,11 +21,14 @@ DELTA_ENV=production \
 DELTA_DRY_RUN=false \
 DELTA_PRODUCTION_ACK=LIVE_ORDERS_AUTHORIZED \
 python -m delta_live.session \
-  --asset BTC --size 100 --minutes 25 --start-at 17:00:00 \
+  --asset BTC --size 150 --minutes 25 --start-at 17:00:00 \
+  --slice-size 150 \
   --confirm-production-orders
 ```
 
-The session refuses entry unless the account is flat, both products report 200x leverage, projected free margin is at least USD 30, planned stop risk plus fee buffer is no more than USD 25, spreads are within 15%, and executable credit is at least 95% of combined mid.
+The current production target is 150 contracts per leg, submitted as one concurrent matched 150-contract call/put pair. `DELTA_PERMISSIVE_ENTRY=true` makes the 15% spread, displayed depth, 95% credit, projected-free-margin and modelled-loss checks telemetry-only so they are recorded for later analysis without cancelling the daily entry. Entry uses bounded IOC limits up to 10% through the displayed bid. Credentials, duplicate/open campaign protection, valid two-sided quotes, paired-leg recovery, stop monitoring, forced exit and emergency flatten remain mandatory. The 20-second entry window and up to 10 seconds of missing-leg recovery remain active so a partial or missing leg is completed or flattened without retaining unmatched exposure.
+
+At exit, the session first reconciles the current broker size of each campaign leg. It reads cumulative L2 ask depth for the remaining quantity and submits every live leg concurrently as reduce-only IOC limits. Options priced at USD 5 or less receive a meaningful tick-aware cushion—up to twice the depth price on the first attempt—because a 2% ladder can round back to the same penny-option tick. Larger premiums start with a 5% cushion. Limits remain bounded, widen on subsequent rounds, and fall back to the ticker ask if L2 is unavailable. Final broker positions are reconciled again before the session may report success; emergency flatten remains the outer recovery layer.
 
 ## Monitoring command
 
@@ -42,11 +45,14 @@ This process is read-only. It is not a replacement for an attached broker stop o
 The active local schedule is a single `launchd` job:
 
 - Plist: `~/Library/LaunchAgents/com.rugan.delta-btc-0dte.plist`
+- Keep-awake plist: `~/Library/LaunchAgents/com.rugan.delta-btc-awake.plist`
 - Wrapper: `scripts/run_production_btc_0dte.sh`
-- Schedule: 13 July 2026 at 16:55 IST
+- Schedule: every calendar day at 16:55 IST, including weekends
 - Working directory: `/Users/rugan/Projects/Delta`
 - Logs: `outputs/live/production-scheduler-YYYYMMDD.log`, plus launchd stdout/stderr files
-- Command: production overrides, 100 BTC contracts per leg, wait until 17:00, 25-minute session
+- Command: production overrides, one concurrent matched submission of 150 BTC contracts per leg, wait until 17:00, begin forced exit at 17:24:30
+- The wrapper runs a read-only production preflight at 16:55 and sends the result to Telegram.
+- A nonzero session exit triggers an urgent Telegram message and emergency flat reconciliation.
 
 Verification:
 
@@ -55,7 +61,7 @@ launchctl print gui/$(id -u)/com.rugan.delta-btc-0dte
 launchctl list | rg 'com.rugan.delta-btc-0dte'
 ```
 
-The job is currently loaded and `not running`, which is expected before 16:55. It is not duplicated with a Codex automation.
+The job is loaded and normally shows `not running` outside the 16:55-17:25 session. It is not duplicated with a Codex automation. The plist deliberately has no `Day`, `Month` or weekday restriction. A persistent `caffeinate -i` LaunchAgent prevents idle sleep while the user is logged in. The Mac must still remain powered and logged in; this setup cannot start after shutdown or logout.
 
 ## What failed today
 

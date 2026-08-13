@@ -53,15 +53,53 @@ class ExecutionEngine:
         self.state = State.STARTING
         self.entry_credit: Decimal | None = None
         self.stop_hits = 0
+        # Which legs are actually held. A single-sided fill is retained rather
+        # than flattened, so the risk loop must know what it is protecting.
+        self.live_call = True
+        self.live_put = True
+        # Set by run_session so a stop-out can be attributed to the underlying
+        # move rather than inferred from option repricing after the fact.
+        self.entry_spot: Decimal | None = None
+        self.strike: Decimal | None = None
+        # Filled quantity and notional per symbol on the way out, accumulated by
+        # close_positions so the session can report realised P&L without having
+        # to re-derive it from the event log.
+        self.exit_fills: dict[str, dict[str, Decimal]] = {}
+        # Every order id this engine placed. Commission must be attributed to
+        # the session's own fills: manual trades on the same contract are common
+        # (12 August had 125 manually sold puts on the session's own symbol) and
+        # a symbol-level sum would silently absorb their fees.
+        self.order_ids: set[str] = set()
         settings.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = settings.log_dir / f"events-{self.clock():%Y%m%d}.jsonl"
+
+    def notify(self, text: str) -> None:
+        """Fire-and-forget Telegram send. Never blocks or raises on the caller."""
+        threading.Thread(target=self.notifier.send, args=(text,),
+                         name="telegram-notify", daemon=False).start()
+
+    def record_exit_fill(self, symbol: str, size: int, price: Decimal) -> None:
+        row = self.exit_fills.setdefault(symbol, {"size": Decimal(0), "notional": Decimal(0)})
+        row["size"] += Decimal(size)
+        row["notional"] += Decimal(price) * Decimal(size)
+
+    def record_order_id(self, order_id: object) -> None:
+        """Stored as a STRING. Delta mixes integer ids with UUIDs across product
+        types, so int() both loses ids here and raised in summarise_pnl when it
+        met a UUID on an unrelated fill (13 Aug: commission came back unavailable
+        on a session that had reconciled perfectly)."""
+        if order_id is None:
+            return
+        s = str(order_id).strip()
+        if s:
+            self.order_ids.add(s)
 
     def event(self, name: str, **fields: object) -> None:
         row = {"time": self.clock().isoformat(), "state": self.state.value, "event": name, **fields}
         with self.log_path.open("a") as handle:
             handle.write(json.dumps(row, default=str, sort_keys=True) + "\n")
         if name in {"ready", "no_trade", "adopted_position", "entry_filled", "stop_armed",
-                    "stop_triggered", "closed", "halted"}:
+                    "stop_triggered", "closed", "halted", "fee_coverage_warning"}:
             message = (f"Delta {self.settings.environment.upper()} | {name}\n" +
                        "\n".join(f"{k}: {v}" for k, v in fields.items()))
             # A slow Telegram API must never delay stop arming or risk ticks.
@@ -85,14 +123,22 @@ class ExecutionEngine:
         call, put = Quote.from_ticker(call_row), Quote.from_ticker(put_row)
         gate = entry_gate(call, put, self.strategy.size, self.strategy.max_spread_pct,
                           self.strategy.min_credit_ratio)
-        if not gate.allowed:
+        integrity_failure = gate.reason in {"invalid_size", "missing_two_sided_quote"}
+        if not gate.allowed and (not self.settings.permissive_entry or integrity_failure):
             self.state = State.NO_TRADE
             self.event("no_trade", reason=gate.reason, supported_size=gate.supported_size,
                        executable_credit=gate.executable_credit, mid_credit=gate.mid_credit)
             raise RuntimeError(f"Liquidity gate failed: {gate.reason}")
         self.state = State.READY
+        if not gate.allowed:
+            self.event("entry_gate_warning", reason=gate.reason,
+                       supported_size=gate.supported_size,
+                       executable_credit=gate.executable_credit,
+                       mid_credit=gate.mid_credit,
+                       mode="telemetry_only")
         self.event("ready", call=call.symbol, put=put.symbol, size=self.strategy.size,
-                   executable_credit=gate.executable_credit)
+                   executable_credit=gate.executable_credit,
+                   permissive_entry=self.settings.permissive_entry)
         return call, put
 
     def order_payload(self, product: dict, side: str, size: int, price: Decimal,
@@ -120,16 +166,52 @@ class ExecutionEngine:
     def observe_stop(self, call: Quote, put: Quote) -> bool:
         if self.state != State.OPEN:
             return False
-        executable_buyback = call.ask + put.ask
+        # A leg that was never filled contributes no buyback cost. Including its
+        # ask would inflate the stop trigger and stop a single-leg position early.
+        executable_buyback = Decimal(0)
+        if self.live_call:
+            executable_buyback += call.ask
+        if self.live_put:
+            executable_buyback += put.ask
         self.stop_hits = self.stop_hits + 1 if executable_buyback >= self.stop_level else 0
         self.event("risk_tick", executable_buyback=executable_buyback, stop_level=self.stop_level,
                    consecutive_hits=self.stop_hits, call_mark=call.mark, put_mark=put.mark)
         if self.stop_hits >= self.strategy.persistence_ticks:
             self.state = State.EXITING
             self.event("stop_triggered", executable_buyback=executable_buyback,
-                       stop_level=self.stop_level)
+                       stop_level=self.stop_level,
+                       **self.underlying_move(call, put))
             return True
         return False
+
+    def underlying_move(self, call: Quote, put: Quote) -> dict[str, object]:
+        """Spot at this moment and how far it has travelled since entry.
+
+        Derived from put-call parity on the marks already in hand
+        (spot ~ strike + call_mark - put_mark) rather than a REST call, so it
+        costs nothing inside the risk loop.
+
+        This exists to separate two explanations for a stop-out that the log
+        could not previously distinguish: the underlying genuinely moved, versus
+        premium expanded on vol or spread. Without it the 5 August loss could
+        only be attributed to "the call repriced 75 -> 133", with the size of
+        the actual BTC move inferred rather than measured.
+        """
+        if self.strike is None or not (self.live_call and self.live_put):
+            return {"spot_at_trigger": None, "spot_move_from_entry": None,
+                    "spot_source": "unavailable_single_leg_or_no_strike"}
+        implied = self.strike + call.mark - put.mark
+        move = (implied - self.entry_spot) if self.entry_spot is not None else None
+        out: dict[str, object] = {
+            "spot_at_trigger": implied,
+            "entry_spot": self.entry_spot,
+            "spot_move_from_entry": move,
+            "spot_source": "put_call_parity_on_marks",
+        }
+        if move is not None and self.entry_spot:
+            out["spot_move_pct"] = move / self.entry_spot * 100
+            out["stop_headroom_points"] = self.stop_level - self.entry_credit
+        return out
 
     def halt(self, reason: str) -> None:
         self.state = State.HALTED
