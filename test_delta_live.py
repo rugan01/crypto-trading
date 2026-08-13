@@ -590,7 +590,7 @@ class ExitPnlTests(unittest.TestCase):
                  {"order_id": 999, "commission": "5.00"}]   # manual trade, must be excluded
         with tempfile.TemporaryDirectory() as d:
             eng = self.engine(d, fills)
-            eng.order_ids = {1467300551, 1467357153}
+            eng.order_ids = {"1467300551", "1467357153"}
             eng.record_exit_fill("C-BTC-64200-120826", 125, Decimal("13.7"))
             pnl = summarise_pnl(eng, Decimal("0.001"),
                                 [("C-BTC-64200-120826", Decimal("35"), 125)])
@@ -601,11 +601,25 @@ class ExitPnlTests(unittest.TestCase):
         self.assertEqual(pnl["commission_usd"], Decimal("0.2514"))
         self.assertEqual(pnl["net_usd"], Decimal("2.4111"))
 
+    def test_uuid_order_ids_on_unrelated_fills_do_not_break_the_lookup(self):
+        """13 Aug: Delta returned a UUID order_id on an unrelated product and the
+        int() cast raised, so a cleanly reconciled session reported no net."""
+        fills = [{"order_id": "1467300551", "commission": "0.18"},
+                 {"order_id": "289dfaf09dcc4078b80a84a966881cc7", "commission": "9.99"}]
+        with tempfile.TemporaryDirectory() as d:
+            eng = self.engine(d, fills)
+            eng.record_order_id(1467300551)
+            eng.record_order_id("289dfaf09dcc4078b80a84a966881cc8")   # ours, but a UUID
+            eng.record_exit_fill("C", 125, Decimal("13.7"))
+            pnl = summarise_pnl(eng, Decimal("0.001"), [("C", Decimal("35"), 125)])
+        self.assertIsNotNone(pnl["net_usd"])
+        self.assertEqual(pnl["commission_usd"], Decimal("0.1800"))
+
     def test_manual_trades_on_the_same_contract_are_not_absorbed(self):
         fills = [{"order_id": 1, "commission": "0.10"}, {"order_id": 2, "commission": "9.99"}]
         with tempfile.TemporaryDirectory() as d:
             eng = self.engine(d, fills)
-            eng.order_ids = {1}
+            eng.order_ids = {"1"}
             eng.record_exit_fill("C", 100, Decimal("1"))
             pnl = summarise_pnl(eng, Decimal("0.001"), [("C", Decimal("5"), 100)])
         self.assertEqual(pnl["commission_usd"], Decimal("0.1000"))
@@ -613,7 +627,7 @@ class ExitPnlTests(unittest.TestCase):
     def test_stop_exit_message_names_the_stop_and_carries_net(self):
         with tempfile.TemporaryDirectory() as d:
             eng = self.engine(d, [{"order_id": 1, "commission": "0.25"}])
-            eng.order_ids = {1}
+            eng.order_ids = {"1"}
             eng.record_exit_fill("C", 125, Decimal("13.7"))
             legs = [("C", Decimal("35"), 125)]
             msg = pnl_message(eng, "combined_50_stop",
@@ -627,7 +641,7 @@ class ExitPnlTests(unittest.TestCase):
     def test_time_exit_message_reports_a_loss_with_a_minus_sign(self):
         with tempfile.TemporaryDirectory() as d:
             eng = self.engine(d, [{"order_id": 1, "commission": "0.50"}])
-            eng.order_ids = {1}
+            eng.order_ids = {"1"}
             eng.record_exit_fill("C", 125, Decimal("60"))
             legs = [("C", Decimal("35"), 125)]
             msg = pnl_message(eng, "time_exit",

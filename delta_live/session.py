@@ -370,7 +370,8 @@ def summarise_pnl(engine: ExecutionEngine, contract_value: Decimal,
     try:
         commission = sum((Decimal(str(f.get("commission") or 0))
                           for f in engine.client.fills(page_size=200)
-                          if int(f.get("order_id") or 0) in engine.order_ids), Decimal(0))
+                          if str(f.get("order_id") or "").strip() in engine.order_ids),
+                         Decimal(0))
     except Exception as exc:
         engine.event("pnl_commission_unavailable", error_type=type(exc).__name__, error=str(exc))
     return {

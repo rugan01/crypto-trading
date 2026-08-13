@@ -69,7 +69,7 @@ class ExecutionEngine:
         # the session's own fills: manual trades on the same contract are common
         # (12 August had 125 manually sold puts on the session's own symbol) and
         # a symbol-level sum would silently absorb their fees.
-        self.order_ids: set[int] = set()
+        self.order_ids: set[str] = set()
         settings.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = settings.log_dir / f"events-{self.clock():%Y%m%d}.jsonl"
 
@@ -84,10 +84,15 @@ class ExecutionEngine:
         row["notional"] += Decimal(price) * Decimal(size)
 
     def record_order_id(self, order_id: object) -> None:
-        try:
-            self.order_ids.add(int(order_id))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            pass
+        """Stored as a STRING. Delta mixes integer ids with UUIDs across product
+        types, so int() both loses ids here and raised in summarise_pnl when it
+        met a UUID on an unrelated fill (13 Aug: commission came back unavailable
+        on a session that had reconciled perfectly)."""
+        if order_id is None:
+            return
+        s = str(order_id).strip()
+        if s:
+            self.order_ids.add(s)
 
     def event(self, name: str, **fields: object) -> None:
         row = {"time": self.clock().isoformat(), "state": self.state.value, "event": name, **fields}
