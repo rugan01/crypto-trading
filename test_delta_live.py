@@ -15,7 +15,9 @@ from delta_live.manage_open import open_short_straddle
 from delta_live.session import (FEE_HURDLE_PCT_OF_CREDIT, FEE_RATE, MIN_FEE_COVERAGE_WARN,
                                 close_positions, depth_aware_exit_limit, enter_paired_slices,
                                 pnl_message, summarise_pnl)
+from delta_live.alerting import alert
 from delta_live.size_check import feasible_size
+from delta_live.telegram import Delivery, TelegramNotifier
 
 
 def now_us():
@@ -673,6 +675,76 @@ class ExitPnlTests(unittest.TestCase):
                               summarise_pnl(eng, Decimal("0.001"), legs), False, legs)
         self.assertIn("WARNING: exit incomplete", msg)
         self.assertIn("not closed", msg)
+
+
+class AlertingTests(unittest.TestCase):
+    """15 Aug 2026: DNS died at 16:55. The session never ran AND the alert about
+    it never arrived, because Telegram needs the same network. The log then said
+    "Telegram is not configured" on a box whose credentials were fine."""
+
+    def settings(self, directory, token="t", chat="c"):
+        return Settings("production", True, None, None, token, chat,
+                        TESTNET_REST, TESTNET_PUBLIC_WS, Path(directory), False)
+
+    def test_missing_credentials_and_send_failure_are_different(self):
+        self.assertIs(TelegramNotifier(None, None).deliver("x"), Delivery.NOT_CONFIGURED)
+        with patch("delta_live.telegram.requests.post",
+                   side_effect=__import__("requests").RequestException("dns")):
+            self.assertIs(TelegramNotifier("t", "c").deliver("x"), Delivery.FAILED)
+
+    def test_alert_still_lands_when_the_network_is_down(self):
+        """The whole point: an outage must not be able to silence its own alert."""
+        import requests as rq
+        with tempfile.TemporaryDirectory() as d:
+            with patch("delta_live.telegram.requests.post",
+                       side_effect=rq.RequestException("dns")), \
+                 patch("delta_live.alerting._desktop", return_value="sent"):
+                r = alert(self.settings(d), "margin check failed 4x", level="ERROR")
+            self.assertEqual(r.telegram, "failed")
+            self.assertTrue(r.delivered, "an outage silenced its own alert")
+            self.assertIn("logfile", r.channels_reached)
+            log = (Path(d) / "ALERTS.log").read_text()
+            self.assertIn("margin check failed 4x", log)
+            self.assertIn("[ERROR]", log)
+            # dated marker so an unnoticed failure is visible in a listing
+            self.assertTrue(list(Path(d).glob("ALERT-*.txt")))
+
+    def test_logfile_alone_is_enough_when_every_other_channel_dies(self):
+        import requests as rq
+        with tempfile.TemporaryDirectory() as d:
+            with patch("delta_live.telegram.requests.post",
+                       side_effect=rq.RequestException("dns")), \
+                 patch("delta_live.alerting._desktop", return_value="failed:X"):
+                r = alert(self.settings(d), "everything is down", level="ERROR")
+            self.assertTrue(r.delivered)
+            self.assertEqual(r.channels_reached, ["logfile"])
+
+    def test_info_alerts_do_not_raise_a_desktop_popup(self):
+        """Routine startup notices must not train the alert to be ignored."""
+        with tempfile.TemporaryDirectory() as d:
+            with patch("delta_live.telegram.requests.post") as post:
+                post.return_value.raise_for_status.return_value = None
+                r = alert(self.settings(d), "scheduler started", level="INFO")
+            self.assertEqual(r.desktop, "skipped")
+            self.assertEqual(r.telegram, "sent")
+
+
+class SizeCheckFallbackTests(unittest.TestCase):
+    """A failed margin check must never fall back to the LARGEST size."""
+
+    def test_the_15_aug_fallback_would_have_been_unaffordable(self):
+        # Real numbers from that evening: $108.21 available, spot ~63,000,
+        # credit ~100. The scheduler fell back to the 150 target.
+        avail, spot, credit = Decimal("108.21"), Decimal("63000"), Decimal("100")
+        chosen = feasible_size(avail, spot, credit, target=150)
+        self.assertEqual(chosen, 125, "size_check itself picks an affordable size")
+
+        def margin(n):
+            return spot * Decimal("0.001") / Decimal("200") * 2 * n + credit * Decimal("0.001") * n
+
+        self.assertLessEqual(margin(chosen), avail)
+        self.assertGreater(margin(150), avail,
+                           "the old fallback demanded more margin than the account had")
 
 
 class FeeHurdleTests(unittest.TestCase):

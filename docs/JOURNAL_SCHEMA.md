@@ -254,6 +254,45 @@ it exists to accumulate the sample. Revisit after three flagged sessions.
 
 Covered by `FeeHurdleTests`.
 
+### Failure handling and alerting (effective 15 August 2026)
+
+On 15 August the 16:55 scheduler lost DNS. Every Delta call failed with
+`Failed to resolve 'api.india.delta.exchange'`, the session never started, and
+the account was untouched — correct. Three things around it were not.
+
+**1. A failed margin check fell back to the MAXIMUM size.** The script did
+`size_check_failed ... falling back to target 150`. That is backwards: a failed
+margin check is *missing information*, and the safe response to missing
+information is the smallest position, not the largest. Measured against the real
+balance that evening — $108.21 available, spot ~63,000, credit ~100 — 125 lots
+needs $91.25 and the 150-lot fallback needs **$109.50**, more than the account
+had. Preflight failed too, so nothing traded, but had the network recovered in
+the seconds between the two steps it would have attempted an unaffordable size.
+**A failed size_check is now NO TRADE.**
+
+**2. The alert shared its failure mode with the outage.** Telegram needs the
+same network that had just died, so nothing was delivered. `alert()` in
+`delta_live/alerting.py` now fans out to Telegram, a macOS desktop notification
+and an append-only `outputs/live/ALERTS.log`; the last two need no network, so
+an outage cannot silence the report of that outage. `ERROR` and `NO_TRADE` also
+drop a dated `ALERT-YYYYMMDD.txt` marker so an unnoticed failure is visible in a
+directory listing. `INFO` deliberately does not raise a desktop popup — routine
+startup notices would train the alert to be ignored.
+
+**3. The log blamed the wrong thing.** `TelegramNotifier.send()` returned a bare
+`False` both when credentials were missing and when the request failed, and the
+CLI printed "Telegram is not configured" for both. The credentials were present
+and correct. `deliver()` now returns `Delivery.SENT / NOT_CONFIGURED / FAILED`
+and the CLI names the actual cause.
+
+**Retries.** `DeltaRESTClient` already retried five times, but its backoff spans
+only ~12 seconds and the outage outlasted it. The scheduler now retries the
+margin check `DELTA_SIZE_ATTEMPTS` times (default 4) at `DELTA_SIZE_RETRY_SLEEP`
+seconds apart (default 45), which fits inside the ~5 minutes between 16:55 and
+the 17:00 entry. If every attempt fails it is NO TRADE with an ERROR alert.
+
+Covered by `AlertingTests` and `SizeCheckFallbackTests`.
+
 ### Entry guards are scoped to the traded asset (effective 6 August 2026)
 
 `production_preflight` and `run_session` both refuse to start when leftover

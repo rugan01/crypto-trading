@@ -2,8 +2,22 @@ from __future__ import annotations
 
 import time
 import threading
+from enum import Enum
 
 import requests
+
+
+class Delivery(str, Enum):
+    """Why a send did or did not happen.
+
+    NOT_CONFIGURED and FAILED were both reported as a bare False until
+    2026-08-15, when a DNS outage produced the log line "Telegram is not
+    configured" on a box whose credentials were present and correct. The two
+    have completely different fixes and must never be conflated again.
+    """
+    SENT = "sent"
+    NOT_CONFIGURED = "not_configured"
+    FAILED = "failed"
 
 
 class TelegramNotifier:
@@ -17,9 +31,10 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return bool(self.token and self.chat_id)
 
-    def send(self, text: str) -> bool:
+    def deliver(self, text: str) -> Delivery:
+        """Send, distinguishing "no credentials" from "could not reach Telegram"."""
         if not self.enabled:
-            return False
+            return Delivery.NOT_CONFIGURED
         with self._lock:
             delay = self.min_interval - (time.monotonic() - self._last_sent)
             if delay > 0:
@@ -30,6 +45,10 @@ class TelegramNotifier:
                 response.raise_for_status()
             except requests.RequestException:
                 # Notification failure must never interrupt risk monitoring.
-                return False
+                return Delivery.FAILED
             self._last_sent = time.monotonic()
-        return True
+        return Delivery.SENT
+
+    def send(self, text: str) -> bool:
+        """Back-compat wrapper. Prefer deliver() where the reason matters."""
+        return self.deliver(text) is Delivery.SENT
