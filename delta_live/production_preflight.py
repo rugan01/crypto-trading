@@ -59,10 +59,19 @@ def run_preflight(asset: str, size: int, env_file: Path,
         call_quote.bid * call_contract_value
         + put_quote.bid * put_contract_value
     ) * Decimal("0.50") * size + Decimal("5")
-    if projected_free < min_free_margin and not settings.permissive_entry:
-        raise RuntimeError(f"NO TRADE: projected free margin {projected_free} below {min_free_margin}")
-    if planned_loss > max_loss and not settings.permissive_entry:
-        raise RuntimeError(f"NO TRADE: planned loss {planned_loss} exceeds {max_loss}")
+    # Solvency checks are hard aborts and permissive_entry does not reach them -- see the
+    # long note in session.py. permissive_entry governs market-quality gates (spread,
+    # credit ratio), never whether the account can carry the position. Leaving the bypass
+    # here would let the preflight green-light a session that session.py will now refuse,
+    # which is worse than either behaviour on its own.
+    if projected_free < min_free_margin:
+        raise RuntimeError(
+            f"NO TRADE: projected free margin {projected_free} below {min_free_margin}"
+            f" (permissive_entry={settings.permissive_entry} does not override this)")
+    if planned_loss > max_loss:
+        raise RuntimeError(
+            f"NO TRADE: planned loss {planned_loss} exceeds {max_loss}"
+            f" (permissive_entry={settings.permissive_entry} does not override this)")
 
     warnings = []
     if not gate.allowed:

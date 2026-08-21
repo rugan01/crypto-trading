@@ -603,6 +603,80 @@ class ExitPnlTests(unittest.TestCase):
         self.assertEqual(pnl["commission_usd"], Decimal("0.2514"))
         self.assertEqual(pnl["net_usd"], Decimal("2.4111"))
 
+    def test_reproduces_the_20_august_liquidation(self):
+        """The call leg was LIQUIDATED by the exchange; the engine never closed it.
+
+        Real fills from 20 Aug 2026. Before the fix, exit_debit counted only the put the
+        engine bought back, so the liquidated call contributed its full entry credit and
+        zero debit: the session reported +$14.0694 when it had lost $14.2456 -- a $28.31
+        error with the sign inverted. This is the regression that must never come back.
+        """
+        fills = [
+            {"order_id": "1483098793", "commission": "0.53277",
+             "product_symbol": "P-BTC-72000-200826", "side": "sell", "size": "100",
+             "price": "129"},
+            {"order_id": "1483098798", "commission": "0.091273",
+             "product_symbol": "C-BTC-72000-200826", "side": "sell", "size": "100",
+             "price": "22.1"},
+            # Not one of ours: the exchange's liquidation order.
+            {"order_id": "1483115208", "commission": "0.85250398",
+             "product_symbol": "C-BTC-72000-200826", "side": "buy", "size": "100",
+             "price": "232", "fill_type": "liquidation",
+             "meta_data": {"total_liquidation_fee_in_settling_asset": "4.2625199"}},
+            {"order_id": "1483117997", "commission": "0.01652",
+             "product_symbol": "P-BTC-72000-200826", "side": "buy", "size": "100",
+             "price": "4"},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            eng = self.engine(d, fills)
+            eng.order_ids = {"1483098793", "1483098798", "1483117997"}
+            # The engine only ever closed the put. The call simply vanished.
+            eng.record_exit_fill("P-BTC-72000-200826", 100, Decimal("4"))
+            pnl = summarise_pnl(eng, Decimal("0.001"),
+                                [("C-BTC-72000-200826", Decimal("22.1"), 100),
+                                 ("P-BTC-72000-200826", Decimal("129"), 100)])
+
+        self.assertEqual(pnl["entry_credit_usd"], Decimal("15.1100"))
+        # put 4 * 100 * 0.001 = 0.40  PLUS the liquidated call 232 * 100 * 0.001 = 23.20
+        self.assertEqual(pnl["exit_debit_usd"], Decimal("23.6000"))
+        self.assertEqual(pnl["gross_usd"], Decimal("-8.4900"))
+        self.assertEqual(pnl["commission_usd"], Decimal("1.4931"))
+        self.assertEqual(pnl["liquidation_fee_usd"], Decimal("4.2625"))
+        self.assertTrue(pnl["foreign_close"])
+        self.assertEqual(pnl["net_usd"], Decimal("-14.2456"))
+        self.assertLess(pnl["net_usd"], 0, "a losing session must not report a profit")
+
+    def test_leg_closed_by_a_manual_trade_is_still_priced_in(self):
+        """Same failure shape as a liquidation but without the liquidation markers."""
+        fills = [{"order_id": "1", "commission": "0.10", "product_symbol": "C",
+                  "side": "sell", "size": "100", "price": "50"},
+                 {"order_id": "999", "commission": "0.20", "product_symbol": "C",
+                  "side": "buy", "size": "100", "price": "80"}]
+        with tempfile.TemporaryDirectory() as d:
+            eng = self.engine(d, fills)
+            eng.order_ids = {"1"}
+            pnl = summarise_pnl(eng, Decimal("0.001"), [("C", Decimal("50"), 100)])
+        self.assertEqual(pnl["exit_debit_usd"], Decimal("8.0000"))
+        self.assertEqual(pnl["gross_usd"], Decimal("-3.0000"))
+        self.assertEqual(pnl["liquidation_fee_usd"], Decimal("0.0000"))
+        self.assertTrue(pnl["foreign_close"])
+
+    def test_ordinary_session_is_unchanged_by_the_reconciliation(self):
+        """The fix must not alter a session the engine closed itself."""
+        fills = [{"order_id": "1", "commission": "0.10", "product_symbol": "C",
+                  "side": "sell", "size": "100", "price": "50"},
+                 {"order_id": "2", "commission": "0.05", "product_symbol": "C",
+                  "side": "buy", "size": "100", "price": "20"}]
+        with tempfile.TemporaryDirectory() as d:
+            eng = self.engine(d, fills)
+            eng.order_ids = {"1", "2"}
+            eng.record_exit_fill("C", 100, Decimal("20"))
+            pnl = summarise_pnl(eng, Decimal("0.001"), [("C", Decimal("50"), 100)])
+        self.assertEqual(pnl["exit_debit_usd"], Decimal("2.0000"))
+        self.assertEqual(pnl["gross_usd"], Decimal("3.0000"))
+        self.assertFalse(pnl["foreign_close"])
+        self.assertEqual(pnl["net_usd"], Decimal("2.8500"))
+
     def test_uuid_order_ids_on_unrelated_fills_do_not_break_the_lookup(self):
         """13 Aug: Delta returned a UUID order_id on an unrelated product and the
         int() cast raised, so a cleanly reconciled session reported no net."""

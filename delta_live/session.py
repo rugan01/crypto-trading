@@ -357,29 +357,92 @@ def summarise_pnl(engine: ExecutionEngine, contract_value: Decimal,
     actually held - which on a retained single-leg session is one leg, not two.
 
     Commission comes from authenticated fills restricted to this engine's own
-    order ids, so a manual trade on the same contract cannot be absorbed into
-    the automated session's number. It is best-effort: a fees lookup failing
+    order ids, so an UNRELATED manual trade on the same contract cannot be absorbed
+    into the automated session's number. It is best-effort: a fees lookup failing
     after the book is already flat must not fail the session, so the caller
     reports gross and flags the gap instead.
+
+    The one exception, added after the 20 Aug 2026 liquidation: if a leg we were
+    short is no longer on the book and we did not close it, the fill that DID close
+    it is priced in, whoever placed it. Excluding it does not keep the number clean,
+    it makes the number wrong -- that session reported a $14.07 profit on a $14.25
+    loss. `foreign_close` flags when this happened and `liquidation_fee_usd` carries
+    the exchange's penalty, which is not commission and is not optional.
     """
     entry_credit = sum((price * size for _, price, size in entry_legs), Decimal(0)) * contract_value
     exit_debit = sum((row["notional"] for row in engine.exit_fills.values()),
                      Decimal(0)) * contract_value
-    gross = entry_credit - exit_debit
     commission: Decimal | None = None
+    liquidation_fee = Decimal(0)
+    foreign: list[dict] = []
+
+    # A leg can leave the book without this engine closing it. On 20 Aug 2026 the call
+    # was LIQUIDATED by the exchange at 232 while the engine's own stop was still 38
+    # seconds from firing. `engine.exit_fills` only ever holds fills from orders this
+    # engine placed, so that leg contributed its full entry credit and ZERO exit debit:
+    # the session reported +$14.07 when it had actually lost $14.25, sign inverted, a
+    # $28.31 error. Any leg closed by anyone other than us -- liquidation, a manual
+    # trade, an exchange settlement -- has to be priced from authenticated fills or the
+    # book is fiction.
     try:
+        fills = engine.client.fills(page_size=200)
         commission = sum((Decimal(str(f.get("commission") or 0))
-                          for f in engine.client.fills(page_size=200)
+                          for f in fills
                           if str(f.get("order_id") or "").strip() in engine.order_ids),
                          Decimal(0))
+        wanted = {sym: size for sym, _price, size in entry_legs}
+        closed_by_us = {sym: row["size"] for sym, row in engine.exit_fills.items()}
+        for sym, size in wanted.items():
+            shortfall = Decimal(size) - Decimal(closed_by_us.get(sym, 0))
+            if shortfall <= 0:
+                continue
+            # Find closing fills on this symbol that were NOT ours, newest first.
+            for f in fills:
+                if shortfall <= 0:
+                    break
+                if f.get("product_symbol") != sym:
+                    continue
+                if str(f.get("order_id") or "").strip() in engine.order_ids:
+                    continue
+                if str(f.get("side") or "").lower() != "buy":      # we are always short
+                    continue
+                took = min(shortfall, Decimal(str(f.get("size") or 0)))
+                if took <= 0:
+                    continue
+                price = Decimal(str(f.get("price") or 0))
+                exit_debit += price * took * contract_value
+                commission = (commission or Decimal(0)) + Decimal(str(f.get("commission") or 0))
+                meta = f.get("meta_data") or {}
+                fee = Decimal(str(meta.get("total_liquidation_fee_in_settling_asset")
+                                  or meta.get("liquidation_fee_in_settling_asset") or 0))
+                liquidation_fee += fee
+                foreign.append({"symbol": sym, "size": int(took), "price": str(price),
+                                "fill_type": f.get("fill_type"),
+                                "liquidation_fee": str(fee),
+                                "order_id": str(f.get("order_id") or "")})
+                shortfall -= took
+            if shortfall > 0:
+                engine.event("pnl_unreconciled_leg", symbol=sym, missing_size=int(shortfall),
+                             note="leg left the book and no matching fill was found; "
+                                  "P&L understates the loss on this leg")
     except Exception as exc:
         engine.event("pnl_commission_unavailable", error_type=type(exc).__name__, error=str(exc))
+
+    if foreign:
+        engine.event("pnl_foreign_close", legs=foreign,
+                     liquidation_fee_usd=usd(liquidation_fee),
+                     note="leg(s) closed outside this engine -- priced from authenticated fills")
+
+    gross = entry_credit - exit_debit
+    total_cost = None if commission is None else commission + liquidation_fee
     return {
         "entry_credit_usd": usd(entry_credit),
         "exit_debit_usd": usd(exit_debit),
         "gross_usd": usd(gross),
         "commission_usd": None if commission is None else usd(commission),
-        "net_usd": None if commission is None else usd(gross - commission),
+        "liquidation_fee_usd": usd(liquidation_fee),
+        "foreign_close": bool(foreign),
+        "net_usd": None if total_cost is None else usd(gross - total_cost),
     }
 
 
@@ -473,16 +536,39 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
                      premium_margin=premium_margin, fee_buffer=5, projected_free=projected_free,
                      required_free=min_free_margin, planned_max_loss=planned_max_loss,
                      daily_loss_cap=25)
-        if projected_free < min_free_margin and not settings.permissive_entry:
-            raise RuntimeError(f"NO TRADE: projected free margin {projected_free} below {min_free_margin}")
-        if planned_max_loss > Decimal("25") and not settings.permissive_entry:
-            raise RuntimeError(f"NO TRADE: planned max loss {planned_max_loss} exceeds 25")
-        if settings.permissive_entry and (projected_free < min_free_margin
-                                          or planned_max_loss > Decimal("25")):
-            engine.event("risk_budget_warning", projected_free=projected_free,
+        # SOLVENCY IS NOT NEGOTIABLE AND permissive_entry DOES NOT APPLY TO IT.
+        #
+        # permissive_entry exists to let MARKET-QUALITY gates through -- a wider spread
+        # than ideal, a credit ratio below target. Those are judgements about whether a
+        # trade is attractive. Margin is not a judgement: if free margin cannot carry an
+        # ordinary adverse move, the exchange closes the position for you.
+        #
+        # On 20 Aug 2026 this check computed projected_free = $13.25 against a $30
+        # requirement and, because permissive_entry was on, emitted a warning and entered
+        # anyway. BTC then moved 0.45% in five minutes -- an unremarkable five minutes --
+        # the call mark went 22.1 -> 239.9, and the exchange liquidated the leg at 232
+        # with a $4.26 liquidation fee. The session lost $14.25, the worst on record, and
+        # it was a sizing failure rather than a strategy one: the straddle was fine and
+        # the stop was correctly placed at 226.65, it simply never got the chance.
+        #
+        # This was also the SECOND time permissive_entry allowed an entry free margin
+        # could not support; the first, on 31 July, happened to go unpunished.
+        if projected_free < min_free_margin:
+            engine.event("margin_abort", projected_free=projected_free,
                          required_free=min_free_margin,
-                         planned_max_loss=planned_max_loss,
-                         daily_loss_cap=25, mode="telemetry_only")
+                         permissive_entry=settings.permissive_entry,
+                         note="hard abort: permissive_entry does not apply to solvency")
+            raise RuntimeError(
+                f"NO TRADE: projected free margin {projected_free} below {min_free_margin}"
+                f" (permissive_entry={settings.permissive_entry} does not override this)")
+        if planned_max_loss > Decimal("25"):
+            engine.event("risk_budget_abort", planned_max_loss=planned_max_loss,
+                         daily_loss_cap=25,
+                         permissive_entry=settings.permissive_entry,
+                         note="hard abort: permissive_entry does not apply to the loss cap")
+            raise RuntimeError(
+                f"NO TRADE: planned max loss {planned_max_loss} exceeds 25"
+                f" (permissive_entry={settings.permissive_entry} does not override this)")
     # Market scenario snapshot, recorded every session whether or not it trades.
     # The strike selector already picks the nearest strike, which is provably the
     # right choice; what actually varies day to day is how far spot sits from it
