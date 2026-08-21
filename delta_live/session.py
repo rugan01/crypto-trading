@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta
+from dataclasses import replace
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -15,6 +16,7 @@ from .client import DeltaRESTClient
 from .config import Settings
 from .engine import ExecutionEngine, State, StrategyConfig
 from .liquidity import Quote
+from .size_check import size_within_free_margin
 from .stream import PublicQuoteStream
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -538,40 +540,68 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
                      premium_margin=premium_margin, fee_buffer=5, projected_free=projected_free,
                      required_free=min_free_margin, planned_max_loss=planned_max_loss,
                      daily_loss_cap=25)
-        # SOLVENCY IS NOT NEGOTIABLE AND permissive_entry DOES NOT APPLY TO IT.
+        # SOLVENCY IS NOT A JUDGEMENT, BUT REFUSING IS NOT THE ONLY ANSWER.
         #
         # permissive_entry exists to let MARKET-QUALITY gates through -- a wider spread
         # than ideal, a credit ratio below target. Those are judgements about whether a
-        # trade is attractive. Margin is not a judgement: if free margin cannot carry an
-        # ordinary adverse move, the exchange closes the position for you.
+        # trade is attractive, and they stay advisory. Margin is different: if free margin
+        # cannot carry an ordinary adverse move, the exchange closes the position for you.
         #
-        # On 20 Aug 2026 this check found projected free margin at LESS THAN HALF the
-        # requirement and, because permissive_entry was on, emitted a warning and entered
-        # anyway. BTC then moved 0.45% in five minutes -- an unremarkable five minutes --
-        # the call mark went 22.1 -> 239.9 (a 10x), and the exchange liquidated the leg,
-        # charging a liquidation fee roughly three times the session's entire commission.
-        # It was the worst session on record, and a SIZING failure rather than a strategy
-        # one: the straddle was fine and the stop was correctly placed, it simply never
-        # got the chance to fire.
+        # On 20 Aug 2026 this check found free margin at LESS THAN HALF the requirement
+        # and, because permissive_entry was on, entered anyway at the full size. BTC moved
+        # 0.45% in five minutes -- unremarkable -- the call mark went 22.1 -> 239.9, and
+        # the exchange liquidated the leg. A sizing failure, not a strategy one: the
+        # straddle was fine and the stop was correctly placed, it never got to fire.
         #
-        # This was also the SECOND time permissive_entry allowed an entry free margin
-        # could not support; the first, on 31 July, happened to go unpunished.
+        # The margin arithmetic itself is sound. Delta publishes initial_margin 0.5% and
+        # default_leverage 200x on these products, and `spot * contract_value / 200` is
+        # exactly that 0.5%. What it does NOT model is that maintenance margin (0.25%) is
+        # checked continuously against the mark, so a short leg moving against you eats
+        # headroom faster than the entry calculation implies.
+        #
+        # So the response is to REDUCE SIZE, not to refuse. A smaller position still
+        # produces the session data -- which is the point of running live at all -- at
+        # risk the account can carry. Refusing throws the observation away and teaches
+        # nothing. Only when even the minimum size cannot reserve the required headroom
+        # is there no trade to make.
         if projected_free < min_free_margin:
-            engine.event("margin_abort", projected_free=projected_free,
+            reduced = size_within_free_margin(
+                available, spot, call_quote.bid + put_quote.bid,
+                target=size, min_free=min_free_margin)
+            if reduced <= 0:
+                engine.event("margin_abort", projected_free=projected_free,
+                             required_free=min_free_margin, requested_size=size,
+                             note="even the minimum size cannot reserve the required "
+                                  "free margin; no trade")
+                raise RuntimeError(
+                    f"NO TRADE: projected free margin {projected_free} below "
+                    f"{min_free_margin} and no affordable size clears it")
+            base_margin = spot * contract_value * reduced / Decimal("200") * 2
+            premium_margin = (call_quote.bid + put_quote.bid) * contract_value * reduced
+            projected_free = available - base_margin - premium_margin - Decimal("5")
+            planned_max_loss = ((call_quote.bid + put_quote.bid) * Decimal("0.50")
+                                * contract_value * reduced + Decimal("5"))
+            engine.event("size_reduced_for_margin", requested_size=size,
+                         reduced_size=reduced, projected_free=projected_free,
                          required_free=min_free_margin,
-                         permissive_entry=settings.permissive_entry,
-                         note="hard abort: permissive_entry does not apply to solvency")
-            raise RuntimeError(
-                f"NO TRADE: projected free margin {projected_free} below {min_free_margin}"
-                f" (permissive_entry={settings.permissive_entry} does not override this)")
+                         note="entering smaller rather than refusing; the session still "
+                              "produces data at carryable risk")
+            # StrategyConfig is frozen, so the engine gets a replaced copy rather than a
+            # mutated one. Assigning to strategy.size raises FrozenInstanceError -- and it
+            # would have raised live, at 17:00, inside the one code path that only runs
+            # when margin is already tight.
+            size = reduced
+            strategy = replace(strategy, size=reduced)
+            engine.strategy = strategy
+
+        # The loss cap is sized off the position, so a reduction may already have cleared
+        # it. Re-checked here against whatever size survived.
         if planned_max_loss > Decimal("25"):
             engine.event("risk_budget_abort", planned_max_loss=planned_max_loss,
-                         daily_loss_cap=25,
-                         permissive_entry=settings.permissive_entry,
-                         note="hard abort: permissive_entry does not apply to the loss cap")
+                         daily_loss_cap=25, size=size,
+                         note="planned max loss exceeds the daily cap even after sizing")
             raise RuntimeError(
-                f"NO TRADE: planned max loss {planned_max_loss} exceeds 25"
-                f" (permissive_entry={settings.permissive_entry} does not override this)")
+                f"NO TRADE: planned max loss {planned_max_loss} exceeds 25 at size {size}")
     # Market scenario snapshot, recorded every session whether or not it trades.
     # The strike selector already picks the nearest strike, which is provably the
     # right choice; what actually varies day to day is how far spot sits from it

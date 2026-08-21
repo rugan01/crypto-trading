@@ -1,5 +1,6 @@
 import json
 import tempfile
+from dataclasses import replace
 import time
 import unittest
 from datetime import datetime
@@ -16,7 +17,7 @@ from delta_live.session import (FEE_HURDLE_PCT_OF_CREDIT, FEE_RATE, MIN_FEE_COVE
                                 close_positions, depth_aware_exit_limit, enter_paired_slices,
                                 pnl_message, summarise_pnl)
 from delta_live.alerting import alert
-from delta_live.size_check import feasible_size
+from delta_live.size_check import feasible_size, size_within_free_margin
 from delta_live.telegram import Delivery, TelegramNotifier
 
 
@@ -821,6 +822,51 @@ class SizeCheckFallbackTests(unittest.TestCase):
         self.assertLessEqual(margin(chosen), avail)
         self.assertGreater(margin(150), avail,
                            "the old fallback demanded more margin than the account had")
+
+
+class MarginHeadroomSizingTests(unittest.TestCase):
+    """Reducing size beats refusing: the session still produces data.
+
+    20 Aug 2026: the account could AFFORD 100 lots and the exchange accepted them, then
+    liquidated the call 4.5 minutes later. Affordability is not survivability -- initial
+    margin is charged once, maintenance margin is checked continuously against the mark.
+    """
+
+    def test_reserves_headroom_where_plain_affordability_does_not(self):
+        spot, credit = Decimal("71913"), Decimal("134")
+        available = Decimal("103.58")           # representative of that evening
+        afford = feasible_size(available, spot, credit, target=100)
+        safe = size_within_free_margin(available, spot, credit, target=100,
+                                       min_free=Decimal("30"))
+        self.assertEqual(afford, 100, "the account could afford the full size")
+        self.assertLess(safe, afford, "but not with 30 of headroom left over")
+        self.assertGreaterEqual(safe, 50, "and it should still trade, just smaller")
+
+    def test_chosen_size_actually_leaves_the_required_free_margin(self):
+        spot, credit = Decimal("71913"), Decimal("134")
+        available, min_free = Decimal("103.58"), Decimal("30")
+        n = size_within_free_margin(available, spot, credit, target=100, min_free=min_free)
+        base = spot * Decimal("0.001") / Decimal("200") * 2 * n
+        prem = credit * Decimal("0.001") * n
+        self.assertGreaterEqual(available - base - prem - Decimal("5"), min_free)
+
+    def test_returns_zero_only_when_even_the_minimum_cannot_be_carried(self):
+        spot, credit = Decimal("71913"), Decimal("134")
+        self.assertEqual(size_within_free_margin(Decimal("35"), spot, credit,
+                                                 target=100, min_free=Decimal("30")), 0)
+
+    def test_never_exceeds_the_target(self):
+        spot, credit = Decimal("71913"), Decimal("134")
+        self.assertLessEqual(
+            size_within_free_margin(Decimal("10000"), spot, credit, target=100,
+                                    min_free=Decimal("30")), 100)
+
+    def test_strategy_config_is_frozen_so_size_must_be_replaced_not_assigned(self):
+        """The downsize path rebuilds the config; assigning would raise live at 17:00."""
+        cfg = StrategyConfig(size=100)
+        with self.assertRaises(Exception):
+            cfg.size = 50
+        self.assertEqual(replace(cfg, size=50).size, 50)
 
 
 class FeeHurdleTests(unittest.TestCase):
