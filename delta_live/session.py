@@ -183,7 +183,7 @@ def enter_paired_slices(engine: ExecutionEngine, call_product: dict, put_product
     be filled, the leg that DID fill is kept and traded single-sided rather than
     round-tripped out: closing a good fill to "repair" symmetry pays two lots of
     commission plus the spread and surrenders the entry price, which on
-    2026-08-01 cost $1.03 of commission, $0.60 of slippage, and a re-entry 13
+    2026-08-01 cost about 1.7x the usual commission plus slippage, and a re-entry 13
     points worse on the same contract. The retained leg stays under the normal
     stop and forced-exit rules.
 
@@ -365,9 +365,10 @@ def summarise_pnl(engine: ExecutionEngine, contract_value: Decimal,
     The one exception, added after the 20 Aug 2026 liquidation: if a leg we were
     short is no longer on the book and we did not close it, the fill that DID close
     it is priced in, whoever placed it. Excluding it does not keep the number clean,
-    it makes the number wrong -- that session reported a $14.07 profit on a $14.25
-    loss. `foreign_close` flags when this happened and `liquidation_fee_usd` carries
-    the exchange's penalty, which is not commission and is not optional.
+    it makes the number wrong -- that session reported a PROFIT of roughly the same
+    magnitude as its actual LOSS, sign inverted. `foreign_close` flags when this
+    happened and `liquidation_fee_usd` carries the exchange's penalty, which is not
+    commission and is not optional.
     """
     entry_credit = sum((price * size for _, price, size in entry_legs), Decimal(0)) * contract_value
     exit_debit = sum((row["notional"] for row in engine.exit_fills.values()),
@@ -380,8 +381,9 @@ def summarise_pnl(engine: ExecutionEngine, contract_value: Decimal,
     # was LIQUIDATED by the exchange at 232 while the engine's own stop was still 38
     # seconds from firing. `engine.exit_fills` only ever holds fills from orders this
     # engine placed, so that leg contributed its full entry credit and ZERO exit debit:
-    # the session reported +$14.07 when it had actually lost $14.25, sign inverted, a
-    # $28.31 error. Any leg closed by anyone other than us -- liquidation, a manual
+    # the session reported a profit of about the same size as its real loss -- sign
+    # inverted, roughly double the true figure in error. Any leg closed by anyone
+    # other than us -- liquidation, a manual
     # trade, an exchange settlement -- has to be priced from authenticated fills or the
     # book is fiction.
     try:
@@ -543,13 +545,14 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
         # trade is attractive. Margin is not a judgement: if free margin cannot carry an
         # ordinary adverse move, the exchange closes the position for you.
         #
-        # On 20 Aug 2026 this check computed projected_free = $13.25 against a $30
+        # On 20 Aug 2026 this check found projected free margin at LESS THAN HALF the
         # requirement and, because permissive_entry was on, emitted a warning and entered
         # anyway. BTC then moved 0.45% in five minutes -- an unremarkable five minutes --
-        # the call mark went 22.1 -> 239.9, and the exchange liquidated the leg at 232
-        # with a $4.26 liquidation fee. The session lost $14.25, the worst on record, and
-        # it was a sizing failure rather than a strategy one: the straddle was fine and
-        # the stop was correctly placed at 226.65, it simply never got the chance.
+        # the call mark went 22.1 -> 239.9 (a 10x), and the exchange liquidated the leg,
+        # charging a liquidation fee roughly three times the session's entire commission.
+        # It was the worst session on record, and a SIZING failure rather than a strategy
+        # one: the straddle was fine and the stop was correctly placed, it simply never
+        # got the chance to fire.
         #
         # This was also the SECOND time permissive_entry allowed an entry free margin
         # could not support; the first, on 31 July, happened to go unpunished.
@@ -606,8 +609,8 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
     # Recorded every session, gating nothing. Across 23 completed sessions the
     # correlation between entry credit and net outcome is +0.06 (-0.05 once
     # normalised by credit) - entry credit does NOT predict the result, and a
-    # floor at 50 points would have blocked four sessions worth +$4.02 of the
-    # book's +$12.09 lifetime net. So the warning is on fee COVERAGE, not on
+    # floor at 50 points would have blocked four sessions worth about a THIRD of the
+    # book's lifetime net. So the warning is on fee COVERAGE, not on
     # credit: extrinsic is the only part of the credit that decays, and it has
     # to clear the 7.93% hurdle before any of the trade is edge rather than a
     # directional bet. Three flagged sessions and this gets revisited on data.

@@ -54,7 +54,7 @@ done
 # TARGET size, which is exactly backwards: a failed margin check is missing
 # information, and the safe response to missing information is the smallest
 # position, not the largest. On 15 Aug that fallback would have attempted 150
-# lots needing $109.50 against $108.21 available.
+# lots needing more margin than the account held.
 if [ -z "$BTC_SIZE" ]; then
   echo "NO TRADE: size_check failed ${SIZE_ATTEMPTS}x - refusing to fall back to the target size"
   alert ERROR "Delta BTC 0DTE: NO TRADE. The margin check failed ${SIZE_ATTEMPTS} times (likely network/DNS). No order was placed and the account is untouched."

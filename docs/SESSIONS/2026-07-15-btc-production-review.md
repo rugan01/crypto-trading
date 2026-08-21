@@ -4,7 +4,7 @@ Status: fully automated campaign closed on the planned combined-premium stop; ac
 
 The recurring 16:55 scheduler started correctly, both Telegram readiness messages were delivered, and production preflight passed. At 17:00 the executor selected the 64,600 BTC same-day ATM call and put. It entered 100 contracts per leg as four concurrent matched 25-contract slices. The last put slice needed four retries but completed inside the bounded recovery window, so no unmatched exposure remained.
 
-Average credits were 57.25 for the call and 18.00 for the put, giving 75.25 combined. The executable combined stop was armed at 112.875. At 17:06:59, buyback reached 114.9 for the second consecutive observation and triggered the stop. The call closed at 100 and the put at 2.2. Gross P&L was -$2.6950, Delta-reported commissions were $0.7328685, and net P&L was -$3.4278685.
+Average credits were 57.25 for the call and 18.00 for the put, giving 75.25 combined. The executable combined stop was armed at 112.875. At 17:06:59, buyback reached 114.9 for the second consecutive observation and triggered the stop. The call closed at 100 and the put at 2.2. Gross P&L was small, Delta-reported commissions were as charged, and net P&L was small
 
 This is a strategy loss but an important automation success: scheduler, paired entry, missing-leg recovery, stop detection, two-leg exit and final reconciliation all completed without manual intervention.
 

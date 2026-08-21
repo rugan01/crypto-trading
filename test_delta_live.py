@@ -318,7 +318,7 @@ class LiveEngineTests(unittest.TestCase):
         """The 2026-08-01 failure: call fills, put never does.
 
         The filled call must be KEPT, not bought back. Round-tripping it cost
-        $1.03 of commission plus $0.60 of slippage for no risk benefit.
+        commission plus slippage for no risk benefit.
         """
         class Client:
             def __init__(self):
@@ -603,47 +603,48 @@ class ExitPnlTests(unittest.TestCase):
         self.assertEqual(pnl["commission_usd"], Decimal("0.2514"))
         self.assertEqual(pnl["net_usd"], Decimal("2.4111"))
 
-    def test_reproduces_the_20_august_liquidation(self):
-        """The call leg was LIQUIDATED by the exchange; the engine never closed it.
+    def test_a_liquidated_leg_is_priced_in_not_ignored(self):
+        """A leg the exchange closed for us, reproducing the 20 Aug 2026 failure.
 
-        Real fills from 20 Aug 2026. Before the fix, exit_debit counted only the put the
-        engine bought back, so the liquidated call contributed its full entry credit and
-        zero debit: the session reported +$14.0694 when it had lost $14.2456 -- a $28.31
-        error with the sign inverted. This is the regression that must never come back.
+        Before the fix, exit_debit counted only the put the engine bought back, so the
+        liquidated call contributed its full entry credit and ZERO exit debit -- the
+        session reported a PROFIT of roughly the size of its actual LOSS. Figures here
+        are synthetic; the shape is the real one and it is the shape that must never
+        come back.
         """
         fills = [
-            {"order_id": "1483098793", "commission": "0.53277",
+            {"order_id": "1001", "commission": "0.50",
              "product_symbol": "P-BTC-72000-200826", "side": "sell", "size": "100",
-             "price": "129"},
-            {"order_id": "1483098798", "commission": "0.091273",
+             "price": "130"},
+            {"order_id": "1002", "commission": "0.10",
              "product_symbol": "C-BTC-72000-200826", "side": "sell", "size": "100",
-             "price": "22.1"},
+             "price": "20"},
             # Not one of ours: the exchange's liquidation order.
-            {"order_id": "1483115208", "commission": "0.85250398",
+            {"order_id": "9999", "commission": "0.85",
              "product_symbol": "C-BTC-72000-200826", "side": "buy", "size": "100",
-             "price": "232", "fill_type": "liquidation",
-             "meta_data": {"total_liquidation_fee_in_settling_asset": "4.2625199"}},
-            {"order_id": "1483117997", "commission": "0.01652",
+             "price": "240", "fill_type": "liquidation",
+             "meta_data": {"total_liquidation_fee_in_settling_asset": "4.00"}},
+            {"order_id": "1003", "commission": "0.05",
              "product_symbol": "P-BTC-72000-200826", "side": "buy", "size": "100",
-             "price": "4"},
+             "price": "5"},
         ]
         with tempfile.TemporaryDirectory() as d:
             eng = self.engine(d, fills)
-            eng.order_ids = {"1483098793", "1483098798", "1483117997"}
+            eng.order_ids = {"1001", "1002", "1003"}
             # The engine only ever closed the put. The call simply vanished.
-            eng.record_exit_fill("P-BTC-72000-200826", 100, Decimal("4"))
+            eng.record_exit_fill("P-BTC-72000-200826", 100, Decimal("5"))
             pnl = summarise_pnl(eng, Decimal("0.001"),
-                                [("C-BTC-72000-200826", Decimal("22.1"), 100),
-                                 ("P-BTC-72000-200826", Decimal("129"), 100)])
+                                [("C-BTC-72000-200826", Decimal("20"), 100),
+                                 ("P-BTC-72000-200826", Decimal("130"), 100)])
 
-        self.assertEqual(pnl["entry_credit_usd"], Decimal("15.1100"))
-        # put 4 * 100 * 0.001 = 0.40  PLUS the liquidated call 232 * 100 * 0.001 = 23.20
-        self.assertEqual(pnl["exit_debit_usd"], Decimal("23.6000"))
-        self.assertEqual(pnl["gross_usd"], Decimal("-8.4900"))
-        self.assertEqual(pnl["commission_usd"], Decimal("1.4931"))
-        self.assertEqual(pnl["liquidation_fee_usd"], Decimal("4.2625"))
+        self.assertEqual(pnl["entry_credit_usd"], Decimal("15.0000"))
+        # put 5 * 100 * 0.001 = 0.50  PLUS the liquidated call 240 * 100 * 0.001 = 24.00
+        self.assertEqual(pnl["exit_debit_usd"], Decimal("24.5000"))
+        self.assertEqual(pnl["gross_usd"], Decimal("-9.5000"))
+        self.assertEqual(pnl["commission_usd"], Decimal("1.5000"))
+        self.assertEqual(pnl["liquidation_fee_usd"], Decimal("4.0000"))
         self.assertTrue(pnl["foreign_close"])
-        self.assertEqual(pnl["net_usd"], Decimal("-14.2456"))
+        self.assertEqual(pnl["net_usd"], Decimal("-15.0000"))
         self.assertLess(pnl["net_usd"], 0, "a losing session must not report a profit")
 
     def test_leg_closed_by_a_manual_trade_is_still_priced_in(self):
@@ -807,9 +808,10 @@ class SizeCheckFallbackTests(unittest.TestCase):
     """A failed margin check must never fall back to the LARGEST size."""
 
     def test_the_15_aug_fallback_would_have_been_unaffordable(self):
-        # Real numbers from that evening: $108.21 available, spot ~63,000,
-        # credit ~100. The scheduler fell back to the 150 target.
-        avail, spot, credit = Decimal("108.21"), Decimal("63000"), Decimal("100")
+        # Representative of the 15 Aug evening: a balance that affords 125 lots but
+        # NOT the 150 the scheduler fell back to. Spot and credit are that session's;
+        # the balance is synthetic and only has to sit between the two requirements.
+        avail, spot, credit = Decimal("105.00"), Decimal("63000"), Decimal("100")
         chosen = feasible_size(avail, spot, credit, target=150)
         self.assertEqual(chosen, 125, "size_check itself picks an affordable size")
 
@@ -830,8 +832,8 @@ class FeeHurdleTests(unittest.TestCase):
     one, and no absolute minimum credit follows from commission at all.
     """
     def test_fee_rate_reproduces_a_real_commission(self):
-        # 12 Aug entry: sold 125 calls at 35 on 0.001 contracts -> $4.375 premium.
-        # Delta charged $0.1806875.
+        # Sold 125 calls at 35 on 0.001 contracts. Prices are market data; the point
+        # is that the charge is exactly FEE_RATE of premium traded.
         premium = Decimal("35") * 125 * Decimal("0.001")
         self.assertEqual((premium * FEE_RATE).quantize(Decimal("0.0000001")),
                          Decimal("0.1806875"))
@@ -862,7 +864,7 @@ class FeeHurdleTests(unittest.TestCase):
             return Decimal(extrinsic) / (Decimal(credit) * FEE_HURDLE_PCT_OF_CREDIT)
 
         # 5 Aug: credit 80, extrinsic 7.5 -> the thinnest session on record,
-        # and the worst result of the month at -$9.69.
+        # and the worst result of that month.
         self.assertLess(coverage(80, "7.5"), MIN_FEE_COVERAGE_WARN)
         # 12 Aug: dead ATM, credit 35 of which 55.9 was extrinsic on the quotes.
         self.assertGreater(coverage(35, "55.9"), MIN_FEE_COVERAGE_WARN)
@@ -880,21 +882,24 @@ class AutoSizeTests(unittest.TestCase):
     checked. The requirement is base PLUS premium, and premium scales with the
     day's credit, so the same size fits one day and is rejected the next on an
     identical balance.
+
+    Spot and credit below are the real sessions'; the BALANCES are representative
+    round figures chosen to sit in the same bracket, since the account's actual
+    balance is not something this repo publishes. Each case still pins the same
+    decision the sizer had to make.
     """
 
-    def test_reproduces_8_august_decision_125(self):
-        # available $106.43, spot 64,996.5, credit 96 -> 150 needs $111.89, fails
-        size = feasible_size(Decimal("106.43"), Decimal("64996.5"), Decimal("96"), target=150)
+    def test_credit_96_session_sizes_to_125_not_150(self):
+        size = feasible_size(Decimal("110"), Decimal("64996.5"), Decimal("96"), target=150)
         self.assertEqual(size, 125)
 
-    def test_reproduces_6_august_decision_100(self):
-        # available $83.00, spot 64,584.7, credit 52
-        size = feasible_size(Decimal("83.00"), Decimal("64584.7"), Decimal("52"), target=150)
+    def test_credit_52_session_sizes_to_100(self):
+        size = feasible_size(Decimal("85"), Decimal("64584.7"), Decimal("52"), target=150)
         self.assertEqual(size, 100)
 
-    def test_would_have_reduced_5_august_from_150(self):
-        """5 Aug ran 150 and printed projected_free -2.20 at preflight."""
-        size = feasible_size(Decimal("114.518"), Decimal("64075.6"), Decimal("83.1"), target=150)
+    def test_credit_83_session_would_have_been_reduced_from_150(self):
+        """That session ran 150 and printed a NEGATIVE projected_free at preflight."""
+        size = feasible_size(Decimal("110"), Decimal("64075.6"), Decimal("83.1"), target=150)
         self.assertEqual(size, 125)
 
     def test_never_exceeds_target_even_when_rich(self):

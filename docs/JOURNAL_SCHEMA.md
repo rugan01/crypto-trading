@@ -117,15 +117,15 @@ Private files under `outputs/` are gitignored because they can contain account-s
   The reason this exists: sizing failed three times in three days because the requirement was
   checked against base margin alone. The exchange needs base PLUS premium, and premium scales with
   the day's credit, so the same size fits one day and is rejected the next on an identical balance.
-  On 2026-08-08 base alone was $97.49 against $106.43 available and looked fine; adding $14.40 of
-  premium margin took the real requirement to $111.89.
+  On 2026-08-08 base margin alone looked comfortably affordable; adding premium margin took the
+  real requirement ABOVE the available balance.
 
   Distinct from the `projected_free` telemetry warning, which was reviewed on 2026-08-01 and
   accepted as not applicable to a 20-minute defined-stop book. That one is advisory; this is hard.
 
-  Verified against every sizing decision actually taken: 6 Aug ($83.00, credit 52) -> 100,
-  8 Aug ($106.43, credit 96) -> 125, and 5 Aug ($114.52, credit 83.1) -> 125 where the session
-  in fact ran 150 and printed `projected_free` of -2.20.
+  Verified against every sizing decision actually taken: 6 Aug (credit 52) -> 100, 8 Aug
+  (credit 96) -> 125, and 5 Aug (credit 83.1) -> 125 where the session in fact ran 150 and
+  printed a NEGATIVE `projected_free`.
 - Entry decision at 17:00 IST; mandatory exit begins 17:24:30 and completes by 17:25.
 - Both products must report exactly 200x leverage.
 - Combined executable stop is 1.5 times actual combined fill, persisted twice.
@@ -230,7 +230,7 @@ proportional to premium, a 30-point credit is no more fee-burdened than a
 data agrees: across 23 completed sessions (11 July excluded as the size-1
 shakedown) the correlation between entry credit and net outcome is **+0.06**,
 and **−0.05** once normalised by credit. A 50-point credit floor would have
-blocked four sessions worth **+$4.02** against a lifetime book net of $12.09.
+blocked four sessions worth about a **THIRD** of the book's lifetime net.
 
 8 August is the case that looks like a small-credit loss and is not: credit
 34.50, bought back 34.20, so 0.87% of decay against a 7.93% hurdle. It lost
@@ -249,7 +249,7 @@ cover its own commission from decay at all.
 
 **This gates nothing.** Replayed over the 11 sessions that carry
 `market_context`, it fires 5 times — and the flagged and cleared groups have the
-*same* mean outcome, −$0.33 each. It has no demonstrated predictive power yet;
+*same* mean outcome, a small loss each. It has no demonstrated predictive power yet;
 it exists to accumulate the sample. Revisit after three flagged sessions.
 
 Covered by `FeeHurdleTests`.
@@ -264,9 +264,8 @@ the account was untouched — correct. Three things around it were not.
 `size_check_failed ... falling back to target 150`. That is backwards: a failed
 margin check is *missing information*, and the safe response to missing
 information is the smallest position, not the largest. Measured against the real
-balance that evening — $108.21 available, spot ~63,000, credit ~100 — 125 lots
-needs $91.25 and the 150-lot fallback needs **$109.50**, more than the account
-had. Preflight failed too, so nothing traded, but had the network recovered in
+balance that evening — spot ~63,000, credit ~100 — 125 lots were affordable and
+the 150-lot fallback demanded **MORE MARGIN THAN THE ACCOUNT HELD**. Preflight failed too, so nothing traded, but had the network recovered in
 the seconds between the two steps it would have attempted an unaffordable size.
 **A failed size_check is now NO TRADE.**
 
