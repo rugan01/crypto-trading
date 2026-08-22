@@ -130,3 +130,75 @@ class DeltaRESTClient:
     def cancel_order(self, order_id: int, product_id: int) -> dict[str, Any]:
         self.settings.assert_order_mode(allow_production=os.getenv("DELTA_PRODUCTION_ORDER_MODE") == "1")
         return self.request("DELETE", "/v2/orders", payload={"id": order_id, "product_id": product_id}, auth=True)
+
+
+class PaperRESTClient(DeltaRESTClient):
+    """Reads the real market; simulates every order instead of sending it.
+
+    Why this exists. On 20 and 21 August 2026 the book was liquidated on consecutive
+    sessions -- at 100 lots and then at 50 -- and those two sessions cost more than the
+    other 32 combined ($-25.09 against a lifetime $-20.78, so the book is $+4.31 without
+    them). When the exchange liquidates before the engine's own stop can fire, the
+    strategy is not being tested: a margin-constrained variant of it is. Paper mode keeps
+    every real input -- live quotes, real IVs, the real stop logic, the real clock -- and
+    removes only the thing that was doing the damage.
+
+    Fills are simulated at the price the order would actually have hit, taken from the
+    limit the engine computed against live L2. That is optimistic in one specific way and
+    the log says so: a real IOC can partially fill or miss, and on 21 Aug the live put leg
+    needed two retries before it filled. Paper P&L should therefore be read as the
+    strategy's ceiling, not its expectation.
+
+    Everything that is not order placement passes straight through to the real API, so
+    quotes, balances and fills history remain genuine.
+    """
+
+    def __init__(self, settings, *args, **kwargs):
+        super().__init__(settings, *args, **kwargs)
+        self._paper_seq = 0
+
+    def place_order(self, order: dict[str, Any]) -> dict[str, Any]:
+        self._paper_seq += 1
+        # A limit IOC that we assume crosses in full. `filled()` derives the fill from
+        # size minus unfilled_size and average_fill_price, so the shape must match what
+        # the real endpoint returns or the caller silently sees a zero fill.
+        return {
+            "id": f"PAPER-{self._paper_seq:06d}",
+            "size": int(order.get("size") or 0),
+            "unfilled_size": 0,
+            "average_fill_price": str(order.get("limit_price")),
+            "state": "closed",
+            "product_id": order.get("product_id"),
+            "side": order.get("side"),
+            "client_order_id": order.get("client_order_id"),
+            "paper": True,
+        }
+
+    def cancel_order(self, order_id, product_id) -> dict[str, Any]:
+        return {"id": order_id, "product_id": product_id, "state": "cancelled", "paper": True}
+
+    def positions(self, asset: str | None = None):
+        """No real position is ever opened on paper, so the book is always flat.
+
+        Returning the genuine (empty) position list matters: `close_positions` reconciles
+        against the broker before exiting, and on a real account that reconciliation is
+        what discovered the 20 Aug liquidation. Reporting a fake open position here would
+        make the paper session diverge from the code path the live one takes.
+        """
+        return []
+
+    def active_orders_for(self, asset: str | None = None):
+        return []
+
+
+def make_client(settings, *args, **kwargs) -> DeltaRESTClient:
+    """The only correct way to build a client.
+
+    Paper mode has to be decided here rather than at each call site, because a single
+    site that constructs DeltaRESTClient directly would place real orders while every
+    log line and every event still said `paper`. That failure would be invisible until
+    the fills appeared.
+    """
+    if getattr(settings, "paper_mode", False):
+        return PaperRESTClient(settings, *args, **kwargs)
+    return DeltaRESTClient(settings, *args, **kwargs)

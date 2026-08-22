@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from .client import DeltaRESTClient
+from .client import DeltaRESTClient, make_client
 from .config import Settings
 from .liquidity import Quote, entry_gate, tick_price
 from .telegram import TelegramNotifier
@@ -47,7 +47,7 @@ class ExecutionEngine:
     def __init__(self, settings: Settings, strategy: StrategyConfig,
                  client: DeltaRESTClient | None = None, clock: Callable[[], datetime] | None = None):
         self.settings, self.strategy = settings, strategy
-        self.client = client or DeltaRESTClient(settings)
+        self.client = client or make_client(settings)
         self.clock = clock or (lambda: datetime.now(IST))
         self.notifier = TelegramNotifier(settings.telegram_token, settings.telegram_chat_id)
         self.state = State.STARTING
@@ -96,11 +96,18 @@ class ExecutionEngine:
 
     def event(self, name: str, **fields: object) -> None:
         row = {"time": self.clock().isoformat(), "state": self.state.value, "event": name, **fields}
+        # Stamp EVERY row, not just the interesting ones. A paper session and a live one
+        # produce byte-identical logs otherwise, and the journal reads these files weeks
+        # later with no other way to tell them apart. Getting that wrong would put
+        # simulated P&L into the real book.
+        if getattr(self.settings, "paper_mode", False):
+            row["paper"] = True
         with self.log_path.open("a") as handle:
             handle.write(json.dumps(row, default=str, sort_keys=True) + "\n")
         if name in {"ready", "no_trade", "adopted_position", "entry_filled", "stop_armed",
                     "stop_triggered", "closed", "halted", "fee_coverage_warning"}:
-            message = (f"Delta {self.settings.environment.upper()} | {name}\n" +
+            tag = "PAPER" if getattr(self.settings, "paper_mode", False) else self.settings.environment.upper()
+            message = (f"Delta {tag} | {name}\n" +
                        "\n".join(f"{k}: {v}" for k, v in fields.items()))
             # A slow Telegram API must never delay stop arming or risk ticks.
             threading.Thread(target=self.notifier.send, args=(message,),

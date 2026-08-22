@@ -523,85 +523,128 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
     call_row, put_row = engine.select_atm(chain, spot)
     call_symbol, put_symbol = call_row["symbol"], put_row["symbol"]
     call_product, put_product = client.product(call_symbol), client.product(put_symbol)
-    for product in (call_product, put_product):
-        leverage = Decimal(str(client.order_leverage(int(product["id"]))["leverage"]))
-        if leverage != Decimal("200"):
-            raise RuntimeError(f"NO TRADE: {product['symbol']} leverage is {leverage}, not 200")
+    # Leverage is READ, not assumed. It used to be pinned at exactly 200x and anything
+    # else aborted the session -- which would have blocked the single most effective
+    # response to the 20/21 Aug liquidations. Lower leverage raises the initial margin
+    # per contract, so the exchange's estimated liquidation price moves further from
+    # spot and the engine's own stop gets a chance to fire first. The cost is that the
+    # same balance carries far fewer lots, which is the trade being made deliberately.
+    leverages = []
+    try:
+        for product in (call_product, put_product):
+            lev = Decimal(str(client.order_leverage(int(product["id"]))["leverage"]))
+            if lev <= 0:
+                raise RuntimeError(f"NO TRADE: {product['symbol']} returned invalid leverage {lev}")
+            leverages.append(lev)
+        if leverages[0] != leverages[1]:
+            raise RuntimeError(f"NO TRADE: legs have different leverage "
+                               f"({leverages[0]} vs {leverages[1]}); margin maths assumes one rate")
+        leverage = leverages[0]
+        engine.event("leverage_read", call=str(leverages[0]), put=str(leverages[1]))
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # order_leverage is authenticated and therefore subject to the IP whitelist.
+        # A live session must not proceed without knowing its leverage; a paper one
+        # falls back to the product default so the day still produces data.
+        if not settings.paper_mode:
+            raise
+        leverage = Decimal(str(call_product.get("default_leverage") or 200))
+        engine.event("leverage_unavailable", error_type=type(exc).__name__,
+                     assumed=str(leverage),
+                     note="paper session; leverage read failed, using the product default")
     call_quote, put_quote = engine.preflight(call_row, put_row)
     contract_value = Decimal(str(call_product["contract_value"]))
     if settings.environment == "production":
-        wallet = next(b for b in client.balances() if b.get("asset_symbol") == "USD")
-        available = Decimal(str(wallet["available_balance"]))
-        base_margin = spot * contract_value * size / Decimal("200") * 2
-        premium_margin = (call_quote.bid + put_quote.bid) * contract_value * size
-        projected_free = available - base_margin - premium_margin - Decimal("5")
-        planned_max_loss = (call_quote.bid + put_quote.bid) * Decimal("0.50") * contract_value * size + Decimal("5")
-        engine.event("margin_preflight", available=available, base_margin=base_margin,
-                     premium_margin=premium_margin, fee_buffer=5, projected_free=projected_free,
-                     required_free=min_free_margin, planned_max_loss=planned_max_loss,
-                     daily_loss_cap=25)
-        # SOLVENCY IS NOT A JUDGEMENT, BUT REFUSING IS NOT THE ONLY ANSWER.
-        #
-        # permissive_entry exists to let MARKET-QUALITY gates through -- a wider spread
-        # than ideal, a credit ratio below target. Those are judgements about whether a
-        # trade is attractive, and they stay advisory. Margin is different: if free margin
-        # cannot carry an ordinary adverse move, the exchange closes the position for you.
-        #
-        # On 20 Aug 2026 this check found free margin at LESS THAN HALF the requirement
-        # and, because permissive_entry was on, entered anyway at the full size. BTC moved
-        # 0.45% in five minutes -- unremarkable -- the call mark went 22.1 -> 239.9, and
-        # the exchange liquidated the leg. A sizing failure, not a strategy one: the
-        # straddle was fine and the stop was correctly placed, it never got to fire.
-        #
-        # The margin arithmetic itself is sound. Delta publishes initial_margin 0.5% and
-        # default_leverage 200x on these products, and `spot * contract_value / 200` is
-        # exactly that 0.5%. What it does NOT model is that maintenance margin (0.25%) is
-        # checked continuously against the mark, so a short leg moving against you eats
-        # headroom faster than the entry calculation implies.
-        #
-        # So the response is to REDUCE SIZE, not to refuse. A smaller position still
-        # produces the session data -- which is the point of running live at all -- at
-        # risk the account can carry. Refusing throws the observation away and teaches
-        # nothing. Only when even the minimum size cannot reserve the required headroom
-        # is there no trade to make.
-        if projected_free < min_free_margin:
-            reduced = size_within_free_margin(
-                available, spot, call_quote.bid + put_quote.bid,
-                target=size, min_free=min_free_margin)
-            if reduced <= 0:
-                engine.event("margin_abort", projected_free=projected_free,
-                             required_free=min_free_margin, requested_size=size,
-                             note="even the minimum size cannot reserve the required "
-                                  "free margin; no trade")
-                raise RuntimeError(
-                    f"NO TRADE: projected free margin {projected_free} below "
-                    f"{min_free_margin} and no affordable size clears it")
-            base_margin = spot * contract_value * reduced / Decimal("200") * 2
-            premium_margin = (call_quote.bid + put_quote.bid) * contract_value * reduced
+        # On paper the margin block is TELEMETRY, so a balance lookup that fails must not
+        # cost the session. Delta's IP whitelist rejects authenticated calls whenever the
+        # egress address changes -- six times in August -- and losing a paper session to
+        # that would defeat the entire point of running one, which is to collect data
+        # every day at zero risk.
+        try:
+            wallet = next(b for b in client.balances() if b.get("asset_symbol") == "USD")
+            available = Decimal(str(wallet["available_balance"]))
+        except Exception as exc:
+            if not settings.paper_mode:
+                raise
+            engine.event("margin_preflight_unavailable", error_type=type(exc).__name__,
+                         note="paper session continuing without a margin check; sizing "
+                              "is whatever the scheduler asked for")
+            available = None
+        if available is None:
+            call_quote, put_quote = call_quote, put_quote      # margin block skipped
+            projected_free = planned_max_loss = None
+    if settings.environment == "production" and available is not None:
+            base_margin = spot * contract_value * size / leverage * 2
+            premium_margin = (call_quote.bid + put_quote.bid) * contract_value * size
             projected_free = available - base_margin - premium_margin - Decimal("5")
-            planned_max_loss = ((call_quote.bid + put_quote.bid) * Decimal("0.50")
-                                * contract_value * reduced + Decimal("5"))
-            engine.event("size_reduced_for_margin", requested_size=size,
-                         reduced_size=reduced, projected_free=projected_free,
-                         required_free=min_free_margin,
-                         note="entering smaller rather than refusing; the session still "
-                              "produces data at carryable risk")
-            # StrategyConfig is frozen, so the engine gets a replaced copy rather than a
-            # mutated one. Assigning to strategy.size raises FrozenInstanceError -- and it
-            # would have raised live, at 17:00, inside the one code path that only runs
-            # when margin is already tight.
-            size = reduced
-            strategy = replace(strategy, size=reduced)
-            engine.strategy = strategy
+            planned_max_loss = (call_quote.bid + put_quote.bid) * Decimal("0.50") * contract_value * size + Decimal("5")
+            engine.event("margin_preflight", available=available, base_margin=base_margin,
+                         premium_margin=premium_margin, fee_buffer=5, projected_free=projected_free,
+                         required_free=min_free_margin, planned_max_loss=planned_max_loss,
+                         daily_loss_cap=25)
+            # SOLVENCY IS NOT A JUDGEMENT, BUT REFUSING IS NOT THE ONLY ANSWER.
+            #
+            # permissive_entry exists to let MARKET-QUALITY gates through -- a wider spread
+            # than ideal, a credit ratio below target. Those are judgements about whether a
+            # trade is attractive, and they stay advisory. Margin is different: if free margin
+            # cannot carry an ordinary adverse move, the exchange closes the position for you.
+            #
+            # On 20 Aug 2026 this check found free margin at LESS THAN HALF the requirement
+            # and, because permissive_entry was on, entered anyway at the full size. BTC moved
+            # 0.45% in five minutes -- unremarkable -- the call mark went 22.1 -> 239.9, and
+            # the exchange liquidated the leg. A sizing failure, not a strategy one: the
+            # straddle was fine and the stop was correctly placed, it never got to fire.
+            #
+            # The margin arithmetic itself is sound. Delta publishes initial_margin 0.5% and
+            # default_leverage 200x on these products, and `spot * contract_value / 200` is
+            # exactly that 0.5%. What it does NOT model is that maintenance margin (0.25%) is
+            # checked continuously against the mark, so a short leg moving against you eats
+            # headroom faster than the entry calculation implies.
+            #
+            # So the response is to REDUCE SIZE, not to refuse. A smaller position still
+            # produces the session data -- which is the point of running live at all -- at
+            # risk the account can carry. Refusing throws the observation away and teaches
+            # nothing. Only when even the minimum size cannot reserve the required headroom
+            # is there no trade to make.
+            if projected_free < min_free_margin:
+                reduced = size_within_free_margin(
+                    available, spot, call_quote.bid + put_quote.bid,
+                    target=size, min_free=min_free_margin, leverage=leverage)
+                if reduced <= 0:
+                    engine.event("margin_abort", projected_free=projected_free,
+                                 required_free=min_free_margin, requested_size=size,
+                                 note="even the minimum size cannot reserve the required "
+                                      "free margin; no trade")
+                    raise RuntimeError(
+                        f"NO TRADE: projected free margin {projected_free} below "
+                        f"{min_free_margin} and no affordable size clears it")
+                base_margin = spot * contract_value * reduced / leverage * 2
+                premium_margin = (call_quote.bid + put_quote.bid) * contract_value * reduced
+                projected_free = available - base_margin - premium_margin - Decimal("5")
+                planned_max_loss = ((call_quote.bid + put_quote.bid) * Decimal("0.50")
+                                    * contract_value * reduced + Decimal("5"))
+                engine.event("size_reduced_for_margin", requested_size=size,
+                             reduced_size=reduced, projected_free=projected_free,
+                             required_free=min_free_margin,
+                             note="entering smaller rather than refusing; the session still "
+                                  "produces data at carryable risk")
+                # StrategyConfig is frozen, so the engine gets a replaced copy rather than a
+                # mutated one. Assigning to strategy.size raises FrozenInstanceError -- and it
+                # would have raised live, at 17:00, inside the one code path that only runs
+                # when margin is already tight.
+                size = reduced
+                strategy = replace(strategy, size=reduced)
+                engine.strategy = strategy
 
-        # The loss cap is sized off the position, so a reduction may already have cleared
-        # it. Re-checked here against whatever size survived.
-        if planned_max_loss > Decimal("25"):
-            engine.event("risk_budget_abort", planned_max_loss=planned_max_loss,
-                         daily_loss_cap=25, size=size,
-                         note="planned max loss exceeds the daily cap even after sizing")
-            raise RuntimeError(
-                f"NO TRADE: planned max loss {planned_max_loss} exceeds 25 at size {size}")
+            # The loss cap is sized off the position, so a reduction may already have cleared
+            # it. Re-checked here against whatever size survived.
+            if planned_max_loss > Decimal("25"):
+                engine.event("risk_budget_abort", planned_max_loss=planned_max_loss,
+                             daily_loss_cap=25, size=size,
+                             note="planned max loss exceeds the daily cap even after sizing")
+                raise RuntimeError(
+                    f"NO TRADE: planned max loss {planned_max_loss} exceeds 25 at size {size}")
     # Market scenario snapshot, recorded every session whether or not it trades.
     # The strike selector already picks the nearest strike, which is provably the
     # right choice; what actually varies day to day is how far spot sits from it

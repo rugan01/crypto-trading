@@ -37,6 +37,7 @@ class Settings:
     public_ws_url: str
     log_dir: Path
     permissive_entry: bool = False
+    paper_mode: bool = False
 
     @classmethod
     def load(cls, env_file: Path = Path(".env")) -> "Settings":
@@ -55,9 +56,16 @@ class Settings:
         return cls(environment, env_bool("DELTA_DRY_RUN", True), key, secret,
                    os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"),
                    rest, ws, Path(os.getenv("DELTA_LOG_DIR", "outputs/live")),
-                   env_bool("DELTA_PERMISSIVE_ENTRY", False))
+                   env_bool("DELTA_PERMISSIVE_ENTRY", False),
+                   env_bool("DELTA_PAPER_MODE", False))
 
     def assert_order_mode(self, allow_production: bool = False) -> None:
+        # Paper mode never reaches the exchange, so the production authorisation gates
+        # below do not apply to it. PaperRESTClient short-circuits before this is called;
+        # this branch exists so that a mis-wired call path fails safe rather than
+        # silently placing a real order while the operator believes it is on paper.
+        if self.paper_mode:
+            raise RuntimeError("DELTA_PAPER_MODE is on; orders must not reach the exchange")
         if self.environment == "production" and not allow_production:
             raise RuntimeError("Production orders require an explicit production confirmation")
         if self.environment == "production" and os.getenv("DELTA_PRODUCTION_ACK") != "LIVE_ORDERS_AUTHORIZED":

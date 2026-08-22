@@ -8,12 +8,12 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
-from delta_live.client import DeltaRESTClient
+from delta_live.client import make_client, PaperRESTClient, DeltaRESTClient
 from delta_live.config import Settings, TESTNET_PUBLIC_WS, TESTNET_REST
 from delta_live.engine import ExecutionEngine, State, StrategyConfig
 from delta_live.liquidity import Quote, entry_gate, tick_price
 from delta_live.manage_open import open_short_straddle
-from delta_live.session import (FEE_HURDLE_PCT_OF_CREDIT, FEE_RATE, MIN_FEE_COVERAGE_WARN,
+from delta_live.session import (FEE_HURDLE_PCT_OF_CREDIT, FEE_RATE, MIN_FEE_COVERAGE_WARN, filled,
                                 close_positions, depth_aware_exit_limit, enter_paired_slices,
                                 pnl_message, summarise_pnl)
 from delta_live.alerting import alert
@@ -822,6 +822,43 @@ class SizeCheckFallbackTests(unittest.TestCase):
         self.assertLessEqual(margin(chosen), avail)
         self.assertGreater(margin(150), avail,
                            "the old fallback demanded more margin than the account had")
+
+
+class PaperModeTests(unittest.TestCase):
+    """Paper mode must be indistinguishable downstream and impossible to leak out of."""
+
+    def settings(self, paper: bool):
+        return Settings(environment="production", dry_run=False, api_key="k", api_secret="s",
+                        telegram_token=None, telegram_chat_id=None,
+                        rest_url="https://example.invalid", public_ws_url="wss://example.invalid",
+                        log_dir=Path("."), permissive_entry=False, paper_mode=paper)
+
+    def test_factory_picks_the_paper_client_only_when_the_flag_is_on(self):
+        self.assertIsInstance(make_client(self.settings(True)), PaperRESTClient)
+        self.assertIs(type(make_client(self.settings(False))), DeltaRESTClient)
+
+    def test_simulated_fill_matches_the_real_response_shape(self):
+        """filled() derives size from size-minus-unfilled and reads average_fill_price.
+
+        A shape mismatch here does not raise -- it silently reports a ZERO fill, and the
+        session would log a straddle that never opened.
+        """
+        c = PaperRESTClient(self.settings(True))
+        o = c.place_order({"product_id": 1, "size": 50, "side": "sell",
+                           "limit_price": "128.0", "client_order_id": "x"})
+        self.assertEqual(filled(o), (50, Decimal("128.0")))
+        self.assertTrue(o["paper"])
+
+    def test_paper_book_is_always_flat(self):
+        c = PaperRESTClient(self.settings(True))
+        self.assertEqual(c.positions("BTC"), [])
+        self.assertEqual(c.active_orders_for("BTC"), [])
+
+    def test_order_mode_refuses_even_with_full_production_authorisation(self):
+        """The belt to PaperRESTClient's braces: if a call path ever bypasses the paper
+        client, this must still stop a real order rather than place one silently."""
+        with self.assertRaises(RuntimeError):
+            self.settings(True).assert_order_mode(allow_production=True)
 
 
 class MarginHeadroomSizingTests(unittest.TestCase):
