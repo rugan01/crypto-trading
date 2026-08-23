@@ -1,0 +1,2 @@
+2026-08-23T11:18:13+05:30 [ERROR] P-BTC-77400-210826: liquidation at 76,700 is closer than the stop (ratio 0.89). The stop cannot fire.
+2026-08-23T11:18:13+05:30 [ERROR] DOOMED: liquidation at 76,800 is closer than the stop (ratio 0.60). The stop cannot fire.

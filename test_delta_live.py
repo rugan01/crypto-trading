@@ -824,6 +824,64 @@ class SizeCheckFallbackTests(unittest.TestCase):
                            "the old fallback demanded more margin than the account had")
 
 
+class LiquidationHeadroomTests(unittest.TestCase):
+    """Can the engine's stop actually fire before the exchange closes the position?
+
+    On 20 and 21 Aug 2026 it could not, and on 21 Aug the liquidation beat the stop by
+    one second. Nothing in the engine was asking the question.
+    """
+
+    class Eng:
+        def __init__(self, rows, stop=Decimal("336")):
+            self.rows, self.stop_level, self.events = rows, stop, []
+            self.client = object()
+            self.settings = Settings(environment="production", dry_run=False, api_key="k",
+                                     api_secret="s", telegram_token=None, telegram_chat_id=None,
+                                     rest_url="x", public_ws_url="y", log_dir=Path("."),
+                                     permissive_entry=False, paper_mode=False)
+        def event(self, name, **f):
+            self.events.append((name, f))
+
+    def run_check(self, rows, stop=Decimal("336")):
+        import delta_live.session as sess
+        eng = self.Eng(rows, stop)
+        orig = sess.margined_positions
+        sess.margined_positions = lambda c: rows
+        try:
+            sess.check_liquidation_headroom(eng, eng.settings, Decimal("77000"),
+                                            Decimal("0.001"), 50)
+        finally:
+            sess.margined_positions = orig
+        return {n: f for n, f in eng.events}
+
+    def test_flags_when_the_exchange_liquidates_first(self):
+        """21 Aug shape: liquidation 300 away, stop needs 336. The stop cannot fire."""
+        ev = self.run_check([{"product_symbol": "P-BTC-77400-210826", "mark_price": "77000",
+                              "liquidation_price": "76700", "margin": "20"}])
+        self.assertIn("liquidation_before_stop", ev)
+        self.assertLess(Decimal(ev["liquidation_headroom"]["headroom_ratio"]), 1)
+
+    def test_silent_when_the_stop_has_room(self):
+        ev = self.run_check([{"product_symbol": "P-BTC-77400-210826", "mark_price": "77000",
+                              "liquidation_price": "70000", "margin": "20"}])
+        self.assertNotIn("liquidation_before_stop", ev)
+        self.assertGreater(Decimal(ev["liquidation_headroom"]["headroom_ratio"]), 1)
+
+    def test_uses_the_closest_leg_not_the_average(self):
+        """One safe leg must not mask a leg that is about to be closed."""
+        ev = self.run_check([
+            {"product_symbol": "SAFE", "mark_price": "77000", "liquidation_price": "60000", "margin": "20"},
+            {"product_symbol": "DOOMED", "mark_price": "77000", "liquidation_price": "76800", "margin": "20"}])
+        self.assertEqual(ev["liquidation_headroom"]["symbol"], "DOOMED")
+        self.assertIn("liquidation_before_stop", ev)
+
+    def test_missing_data_reports_unknown_rather_than_safe(self):
+        for rows in ([], [{"product_symbol": "X", "mark_price": None, "liquidation_price": None}]):
+            ev = self.run_check(rows)
+            self.assertIn("liquidation_headroom_unavailable", ev)
+            self.assertNotIn("liquidation_before_stop", ev)
+
+
 class PaperModeTests(unittest.TestCase):
     """Paper mode must be indistinguishable downstream and impossible to leak out of."""
 

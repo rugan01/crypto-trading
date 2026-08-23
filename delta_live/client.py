@@ -202,3 +202,15 @@ def make_client(settings, *args, **kwargs) -> DeltaRESTClient:
     if getattr(settings, "paper_mode", False):
         return PaperRESTClient(settings, *args, **kwargs)
     return DeltaRESTClient(settings, *args, **kwargs)
+
+
+def margined_positions(client: DeltaRESTClient) -> list[dict[str, Any]]:
+    """Open positions WITH Delta's own liquidation price.
+
+    /v2/positions returns only size and entry price. /v2/positions/margined is the one
+    that carries `liquidation_price`, `bankruptcy_price`, `margin` and `mark_price` --
+    the numbers needed to tell whether the exchange will close a position before the
+    engine's stop can. There is no order-preview endpoint; /v2/orders/preview is a 404.
+    """
+    out = client.request("GET", "/v2/positions/margined", {}, auth=True)
+    return out if isinstance(out, list) else (out.get("result") or [])

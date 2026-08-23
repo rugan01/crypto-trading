@@ -12,7 +12,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .client import DeltaRESTClient
+from .client import DeltaRESTClient, margined_positions
 from .config import Settings
 from .engine import ExecutionEngine, State, StrategyConfig
 from .liquidity import Quote
@@ -751,6 +751,8 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
     engine.record_entry(call_fill if engine.live_call else Decimal(0),
                         put_fill if engine.live_put else Decimal(0))
 
+    check_liquidation_headroom(engine, settings, spot, contract_value, size)
+
     book = QuoteBook()
     stream = PublicQuoteStream(settings.public_ws_url, [call_symbol, put_symbol], book.update)
     stream.start()
@@ -810,6 +812,91 @@ def run_session(asset: str, size: int, minutes: int, env_file: Path,
         engine.event("session_pnl_failed", error_type=type(exc).__name__, error=str(exc))
     return 0 if ok else 3
 
+
+
+
+def check_liquidation_headroom(engine, settings, spot: Decimal, contract_value: Decimal,
+                               size: int) -> None:
+    """Will the EXCHANGE close this position before the engine's own stop can fire?
+
+    This is the check that was missing on 20 and 21 August 2026, when the book was
+    liquidated on consecutive sessions -- the put on one, the call on the other -- and on
+    21 Aug the liquidation landed ONE SECOND before the stop triggered. A stop that
+    cannot fire is not risk management, it is decoration, and nothing in the engine was
+    asking whether it could fire.
+
+    Delta publishes its own answer. /v2/positions/margined carries `liquidation_price`
+    per position; there is no pre-trade preview (/v2/orders/preview is a 404), so the
+    reading is taken immediately AFTER entry, which is the earliest the number exists.
+
+    Comparing the two requires putting them in the same units. The stop is on COMBINED
+    PREMIUM: it fires when the buy-back cost reaches `stop_level`. Liquidation is on
+    SPOT. For a 0DTE straddle the bridge is intrinsic value -- with hours to expiry the
+    combined ask converges on |spot - strike|, so the spot move that lifts the combined
+    to `stop_level` is approximately `stop_level` itself in dollars. That approximation
+    is not free-hand: on 21 Aug the stop level was 336 and the combined crossed it on a
+    spot move of 322, inside 5%.
+
+    The event is emitted every session so the relationship can be measured rather than
+    trusted. It escalates only when the exchange is demonstrably closer than the stop.
+    """
+    try:
+        rows = margined_positions(engine.client)
+    except Exception as exc:
+        engine.event("liquidation_headroom_unavailable", error_type=type(exc).__name__,
+                     note="could not read /v2/positions/margined; headroom unknown")
+        return
+    if not rows:
+        # Expected on paper -- no real position exists, so Delta has nothing to price.
+        engine.event("liquidation_headroom_unavailable",
+                     note=("no margined position returned"
+                           + (" (paper session)" if settings.paper_mode else "")))
+        return
+
+    stop_level = engine.stop_level
+    if stop_level is None:
+        return
+    stop_distance = Decimal(str(stop_level))          # dollars of spot, see docstring
+    worst = None
+    for row in rows:
+        liq = row.get("liquidation_price")
+        mark = row.get("mark_price")
+        if not liq or not mark:
+            continue
+        liq_d, mark_d = Decimal(str(liq)), Decimal(str(mark))
+        distance = abs(mark_d - liq_d)
+        if worst is None or distance < worst[0]:
+            worst = (distance, row.get("product_symbol"), liq_d, mark_d, row.get("margin"))
+    if worst is None:
+        engine.event("liquidation_headroom_unavailable",
+                     note="positions returned without a liquidation price")
+        return
+
+    distance, symbol, liq_d, mark_d, margin = worst
+    ratio = (distance / stop_distance) if stop_distance > 0 else None
+    engine.event("liquidation_headroom",
+                 symbol=symbol, liquidation_price=str(liq_d), mark_price=str(mark_d),
+                 spot_distance_to_liquidation=str(distance),
+                 stop_level=str(stop_level),
+                 approx_spot_distance_to_stop=str(stop_distance),
+                 headroom_ratio=(str(round(ratio, 3)) if ratio is not None else None),
+                 position_margin=str(margin),
+                 note=("distance to liquidation divided by the spot move that would "
+                       "trigger the stop; below 1.0 the exchange closes first"))
+
+    if ratio is not None and ratio < Decimal("1"):
+        engine.event("liquidation_before_stop", symbol=symbol,
+                     headroom_ratio=str(round(ratio, 3)),
+                     note="THE STOP CANNOT FIRE: the exchange liquidates first. This is "
+                          "the 20/21 Aug failure. Reduce size or lower leverage.")
+        try:
+            from .alerting import alert
+            alert(settings,
+                  f"{symbol}: liquidation at {liq_d:,.0f} is closer than the stop "
+                  f"(ratio {ratio:.2f}). The stop cannot fire.",
+                  level="ERROR", title="Delta BTC 0DTE")
+        except Exception:
+            pass
 
 def close_positions(engine: ExecutionEngine, legs: list[tuple[dict, str, int]],
                     reconcile_positions: bool = False) -> bool:
